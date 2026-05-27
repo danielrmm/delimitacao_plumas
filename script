@@ -1,0 +1,2502 @@
+# -*- coding: utf-8 -*-
+"""
+Delimitação de Plumas de Contaminação — Processing Algorithm (QGIS 3.x)
+================================================================================
+VERSÃO: rv4
+================================================================================
+
+Gera polígonos de delimitação geométrica de plumas de contaminação a partir de
+pontos de amostragem classificados em CONTAMINADOS (concentração > VI) ou
+NÃO CONTAMINADOS (concentração <= VI), aplicando regras geométricas
+normativas (não geoestatísticas).
+
+Regras suportadas:
+    - Regra 50%  -> ponto-limite no ponto médio entre par
+    - Regra 75%  -> ponto-limite a 3/4 do caminho do contaminado
+                    em direção ao não contaminado
+
+NOVIDADES rv4:
+
+    1. CRITÉRIO DE BORDA SIMPLIFICADO. Detecção de contaminados de borda
+       passa a usar APENAS o gap angular entre vizinhos Delaunay (sem
+       o critério de convex hull). Um contaminado é considerado de
+       borda quando há um setor angular maior que θ° sem nenhum vizinho
+       Delaunay próximo. O threshold θ é configurável (padrão 90°).
+       Logs detalhados informam o gap medido para cada contaminado.
+
+    2. SUAVIZAÇÃO CATMULL-ROM como método padrão. Algoritmo interpolador
+       (a curva PASSA pelos vértices originais) que preserva área e
+       produz contornos suaves similares ao "Bezier interpolation" de
+       outros softwares SIG. Implementado em Python puro, sem
+       dependências externas. Chaikin permanece disponível como
+       alternativa para área conservadora.
+
+NOVIDADES rv3 (mantidas):
+    - Extrapolação de plumas abertas com geração de pontos virtuais
+
+NOVIDADES rv2 (mantidas):
+    - Validação Voronoi de pontos-limite
+    - Filtro estatístico de arestas Delaunay longas
+    - Validação pós-construção de não-contaminados internos
+    - Concave hull (alpha shape) como método de fechamento alternativo
+    - Buffer fallback para grupos com <3 pontos-limite
+
+NOVIDADES rv1 (mantidas):
+    - Suavização com validação de fidelidade aos contaminados
+
+Autor: Especialista em PyQGIS / Geoprocessamento Ambiental
+Licença: Uso livre para fins técnicos. Sem garantia.
+================================================================================
+"""
+
+import math
+from collections import defaultdict, deque
+
+from qgis.PyQt.QtCore import QCoreApplication, QVariant
+from qgis.core import (
+    QgsProcessing,
+    QgsProcessingAlgorithm,
+    QgsProcessingException,
+    QgsProcessingParameterFeatureSource,
+    QgsProcessingParameterField,
+    QgsProcessingParameterEnum,
+    QgsProcessingParameterBoolean,
+    QgsProcessingParameterNumber,
+    QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterDefinition,
+    QgsFeature,
+    QgsFeatureRequest,
+    QgsField,
+    QgsFields,
+    QgsGeometry,
+    QgsPointXY,
+    QgsWkbTypes,
+    QgsProject,
+    QgsCoordinateReferenceSystem,
+    QgsProcessingUtils,
+    QgsFeatureSink,
+)
+import processing
+
+
+# ============================================================================
+# CONSTANTES / OPÇÕES
+# ============================================================================
+
+REGRAS = ['Regra 50% (ponto médio)', 'Regra 75% (mais próximo do não contaminado)']
+FRACAO_POR_REGRA = {0: 0.50, 1: 0.75}
+
+MODOS_SAIDA = [
+    'Um polígono por contaminante/grupo',
+    'Vários polígonos (plumas espacialmente separadas)',
+]
+
+METODOS_FECHAMENTO = [
+    'Ordenamento angular por centroide (rv1)',
+    'Concave Hull / alpha shape (nativo QGIS)',
+]
+
+METODOS_SUAVIZACAO = [
+    'Catmull-Rom (interpolador, preserva área)',
+    'Chaikin (aproximador, contrai cantos)',
+]
+
+
+# ============================================================================
+# CLASSE PRINCIPAL DO ALGORITMO
+# ============================================================================
+
+class DelimitacaoPlumasAlgorithm(QgsProcessingAlgorithm):
+    """Processing algorithm — delimitação geométrica de plumas."""
+
+    # Identificadores de parâmetros
+    INPUT = 'INPUT'
+    USE_SELECTED = 'USE_SELECTED'
+
+    FIELD_ID = 'FIELD_ID'
+    FIELD_CONTAMINANTE = 'FIELD_CONTAMINANTE'
+    FIELD_CONCENTRACAO = 'FIELD_CONCENTRACAO'
+    FIELD_VI = 'FIELD_VI'
+    FIELDS_GRUPO = 'FIELDS_GRUPO'
+
+    REGRA = 'REGRA'
+    MODO_SAIDA = 'MODO_SAIDA'
+    GERAR_LINHAS = 'GERAR_LINHAS'
+
+    # Suavização (rv1 + rv4)
+    SUAVIZAR = 'SUAVIZAR'
+    METODO_SUAVIZACAO = 'METODO_SUAVIZACAO'        # rv4 — Catmull-Rom | Chaikin
+    SUAVIZAR_SUBDIVISOES = 'SUAVIZAR_SUBDIVISOES'  # rv4 — para Catmull-Rom
+    SUAVIZAR_TENSAO = 'SUAVIZAR_TENSAO'            # rv4 — tensão Cardinal Spline
+    SUAVIZAR_ITERACOES = 'SUAVIZAR_ITERACOES'      # para Chaikin
+    SUAVIZAR_OFFSET = 'SUAVIZAR_OFFSET'            # para Chaikin
+
+    # Filtros e validações (rv2)
+    FILTRO_K_MAD = 'FILTRO_K_MAD'              # filtro arestas longas
+    VALIDAR_VORONOI = 'VALIDAR_VORONOI'        # validação ponto-limite
+    METODO_FECHAMENTO = 'METODO_FECHAMENTO'    # angular | concave hull
+    CONCAVE_ALPHA = 'CONCAVE_ALPHA'            # alpha do concave hull
+    BUFFER_FALLBACK = 'BUFFER_FALLBACK'        # buffer p/ <3 pontos-limite
+    BUFFER_FATOR = 'BUFFER_FATOR'              # fator do raio do buffer
+
+    # Extrapolação de plumas abertas (rv3 + rv4)
+    EXTRAPOLAR_PLUMAS_ABERTAS = 'EXTRAPOLAR_PLUMAS_ABERTAS'
+    EXTRAPOLAR_FATOR_DISTANCIA = 'EXTRAPOLAR_FATOR_DISTANCIA'
+    EXTRAPOLAR_GERAR_POLIGONO_SEPARADO = 'EXTRAPOLAR_GERAR_POLIGONO_SEPARADO'
+    EXTRAPOLAR_GAP_ANGULAR_GRAUS = 'EXTRAPOLAR_GAP_ANGULAR_GRAUS'  # rv4
+
+    OUTPUT_POLIGONOS = 'OUTPUT_POLIGONOS'
+    OUTPUT_PONTOS_LIMITE = 'OUTPUT_PONTOS_LIMITE'
+    OUTPUT_LINHAS = 'OUTPUT_LINHAS'
+
+    # ------------------------------------------------------------------
+    # METADADOS
+    # ------------------------------------------------------------------
+
+    def tr(self, string):
+        return QCoreApplication.translate('DelimitacaoPlumas', string)
+
+    def createInstance(self):
+        return DelimitacaoPlumasAlgorithm()
+
+    def name(self):
+        return 'delimitacao_plumas_geometrica_rv4'
+
+    def displayName(self):
+        return self.tr('Delimitação geométrica de plumas (50% / 75%) — rv4')
+
+    def group(self):
+        return self.tr('Áreas Contaminadas (GAC)')
+
+    def groupId(self):
+        return 'gac_delimitacao'
+
+    def shortHelpString(self):
+        return self.tr(
+            "Gera polígonos de delimitação de plumas de contaminação a partir "
+            "de pontos de amostragem classificados como contaminados "
+            "(conc. > VI) ou não contaminados (conc. <= VI).\n\n"
+            "═══════════════════════════════════════════════════\n"
+            "PARA USO BÁSICO\n"
+            "═══════════════════════════════════════════════════\n"
+            "Os parâmetros de uso comum aparecem na seção principal do "
+            "diálogo. Escolha:\n"
+            "  • Camada de pontos de amostragem\n"
+            "  • Campos do contaminante, concentração e VI\n"
+            "  • Regra (50% ou 75% da distância)\n"
+            "  • Modo de saída (uma pluma ou plumas separadas)\n\n"
+            "Os parâmetros AVANÇADOS (filtros estatísticos, suavização, "
+            "concave hull, buffer fallback, extrapolação) ficam na "
+            "seção 'Advanced parameters' e mantêm valores padrão "
+            "tecnicamente sensatos.\n\n"
+            "═══════════════════════════════════════════════════\n"
+            "REQUISITOS TÉCNICOS\n"
+            "═══════════════════════════════════════════════════\n"
+            "Camada de pontos em CRS PROJETADO (metros). A concentração "
+            "serve apenas para classificar; concentrações = 0 são "
+            "tratadas como NÃO contaminado (LD/LQ).\n\n"
+            "═══════════════════════════════════════════════════\n"
+            "FUNCIONALIDADE NOVA EM rv3 — EXTRAPOLAÇÃO\n"
+            "═══════════════════════════════════════════════════\n"
+            "Quando contaminados aparecem na borda externa da malha "
+            "amostral, a delimitação não foi fechada e novos poços "
+            "deveriam ser instalados. A funcionalidade EXTRAPOLAR "
+            "PLUMAS ABERTAS detecta esses casos e gera pontos-limite "
+            "virtuais para representar visualmente a parte ESTIMADA "
+            "da pluma, sinalizada explicitamente nas saídas.\n\n"
+            "ATENÇÃO: a parte extrapolada NÃO tem evidência amostral "
+            "direta. Use apenas com fim cartográfico de comunicar "
+            "necessidade de campanha de investigação adicional."
+        )
+
+    # ------------------------------------------------------------------
+    # PARÂMETROS DE ENTRADA
+    # ------------------------------------------------------------------
+
+    def initAlgorithm(self, config=None):
+        # Camada de entrada (pontos)
+        self.addParameter(
+            QgsProcessingParameterFeatureSource(
+                self.INPUT,
+                self.tr('Camada de pontos de amostragem'),
+                [QgsProcessing.TypeVectorPoint],
+            )
+        )
+
+        # Usar apenas selecionados
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.USE_SELECTED,
+                self.tr('Processar apenas feições selecionadas'),
+                defaultValue=False,
+            )
+        )
+
+        # Campo identificador
+        self.addParameter(
+            QgsProcessingParameterField(
+                self.FIELD_ID,
+                self.tr('Campo identificador do ponto'),
+                parentLayerParameterName=self.INPUT,
+                type=QgsProcessingParameterField.Any,
+                optional=True,
+            )
+        )
+
+        # Campo do contaminante
+        self.addParameter(
+            QgsProcessingParameterField(
+                self.FIELD_CONTAMINANTE,
+                self.tr('Campo com o nome do contaminante'),
+                parentLayerParameterName=self.INPUT,
+                type=QgsProcessingParameterField.String,
+            )
+        )
+
+        # Campo da concentração
+        self.addParameter(
+            QgsProcessingParameterField(
+                self.FIELD_CONCENTRACAO,
+                self.tr('Campo com a concentração medida (numérico)'),
+                parentLayerParameterName=self.INPUT,
+                type=QgsProcessingParameterField.Numeric,
+            )
+        )
+
+        # Campo do VI (valor de referência)
+        self.addParameter(
+            QgsProcessingParameterField(
+                self.FIELD_VI,
+                self.tr('Campo com o valor de referência legal — VI (numérico)'),
+                parentLayerParameterName=self.INPUT,
+                type=QgsProcessingParameterField.Numeric,
+            )
+        )
+
+        # Campos de agrupamento opcionais (multi)
+        self.addParameter(
+            QgsProcessingParameterField(
+                self.FIELDS_GRUPO,
+                self.tr('Campos opcionais de agrupamento '
+                        '(profundidade, campanha, horizonte, aquífero, etc.)'),
+                parentLayerParameterName=self.INPUT,
+                type=QgsProcessingParameterField.Any,
+                allowMultiple=True,
+                optional=True,
+            )
+        )
+
+        # Regra
+        self.addParameter(
+            QgsProcessingParameterEnum(
+                self.REGRA,
+                self.tr('Regra de delimitação'),
+                options=REGRAS,
+                defaultValue=0,
+            )
+        )
+
+        # Modo de saída
+        self.addParameter(
+            QgsProcessingParameterEnum(
+                self.MODO_SAIDA,
+                self.tr('Modo de geração dos polígonos'),
+                options=MODOS_SAIDA,
+                defaultValue=1,  # padrão = plumas separadas
+            )
+        )
+
+        # Gerar camada de linhas (opcional) — diagnóstico avançado
+        param_lin = QgsProcessingParameterBoolean(
+            self.GERAR_LINHAS,
+            self.tr('Gerar camada auxiliar de linhas '
+                    '(pares contaminado/não contaminado)'),
+            defaultValue=False,
+        )
+        param_lin.setFlags(
+            param_lin.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(param_lin)
+
+        # ----- SUAVIZAÇÃO DO POLÍGONO (rv1 + rv4) -------------------------
+        # rv4 oferece dois métodos:
+        #
+        # CATMULL-ROM (padrão, recomendado para apresentação cartográfica):
+        #   - Algoritmo INTERPOLADOR: a curva passa pelos vértices originais
+        #   - Preserva a área do polígono (variação <3%)
+        #   - Equivalente prático ao "Bezier interpolation" do ArcGIS
+        #   - Único parâmetro ajustável: número de subdivisões por aresta
+        #
+        # CHAIKIN (alternativa, para área conservadora):
+        #   - Algoritmo APROXIMADOR: a curva NÃO passa pelos vértices
+        #   - Contrai os cantos (área final ~75% da original com offset 0.25)
+        #   - Parâmetros ajustáveis: número de iterações e offset
+        #
+        # NÍVEL BÁSICO: ligar/desligar a suavização e escolher o método.
+        # NÍVEL AVANÇADO: ajustar parâmetros específicos de cada método.
+
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.SUAVIZAR,
+                self.tr('Suavizar polígono final'),
+                defaultValue=True,
+            )
+        )
+
+        # Método de suavização — visível para todos
+        self.addParameter(
+            QgsProcessingParameterEnum(
+                self.METODO_SUAVIZACAO,
+                self.tr('Método de suavização'),
+                options=METODOS_SUAVIZACAO,
+                defaultValue=0,  # Catmull-Rom
+            )
+        )
+
+        # Subdivisões para Catmull-Rom — avançado
+        # Cada aresta original é substituída por N segmentos curvos.
+        # Mais subdivisões = curva mais suave, mais vértices.
+        # Recomendação por escala de mapa:
+        #   - 1:1.000 ou maior:  16-24 subdivisões
+        #   - 1:5.000:           12 subdivisões
+        #   - 1:10.000+:         8 subdivisões
+        param_sub = QgsProcessingParameterNumber(
+            self.SUAVIZAR_SUBDIVISOES,
+            self.tr('Catmull-Rom — subdivisões por aresta '
+                    '(6 a 32)'),
+            type=QgsProcessingParameterNumber.Integer,
+            defaultValue=16,
+            minValue=6,
+            maxValue=32,
+            optional=True,
+        )
+        param_sub.setFlags(
+            param_sub.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(param_sub)
+
+        # Tensão da Cardinal Spline (Catmull-Rom generalizado).
+        # Controla quanto a curva "se afasta" do polígono original:
+        #   0.00 = sem suavização (volta ao polígono original)
+        #   0.15 = suavização leve, expansão de área ~8%
+        #   0.30 = padrão equilibrado, expansão ~13-15% (recomendado)
+        #   0.50 = Catmull-Rom clássico, expansão ~25% (mais "estouro")
+        #   0.75 = curva muito tensa, expansão >30%
+        # Valores mais baixos preservam mais a forma original;
+        # valores mais altos suavizam mais mas expandem o polígono.
+        param_tens = QgsProcessingParameterNumber(
+            self.SUAVIZAR_TENSAO,
+            self.tr('Catmull-Rom — tensão da curva '
+                    '(0,0 a 1,0; menor = menos expansão)'),
+            type=QgsProcessingParameterNumber.Double,
+            defaultValue=0.30,
+            minValue=0.0,
+            maxValue=1.0,
+            optional=True,
+        )
+        param_tens.setFlags(
+            param_tens.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(param_tens)
+
+        # Iterações Chaikin — avançado, usado apenas com método Chaikin
+        param_iter = QgsProcessingParameterNumber(
+            self.SUAVIZAR_ITERACOES,
+            self.tr('Chaikin — número de iterações '
+                    '(1 a 5; usado apenas com método Chaikin)'),
+            type=QgsProcessingParameterNumber.Integer,
+            defaultValue=2,
+            minValue=1,
+            maxValue=5,
+            optional=True,
+        )
+        param_iter.setFlags(
+            param_iter.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(param_iter)
+
+        # Offset Chaikin — avançado, usado apenas com método Chaikin
+        param_off = QgsProcessingParameterNumber(
+            self.SUAVIZAR_OFFSET,
+            self.tr('Chaikin — offset '
+                    '(0,10 a 0,45; usado apenas com método Chaikin)'),
+            type=QgsProcessingParameterNumber.Double,
+            defaultValue=0.25,
+            minValue=0.05,
+            maxValue=0.45,
+            optional=True,
+        )
+        param_off.setFlags(
+            param_off.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(param_off)
+
+        # =========================================================
+        # PARÂMETROS rv2 — FILTROS E VALIDAÇÕES GEOMÉTRICAS
+        # (todos avançados — defaults são tecnicamente sensatos)
+        # =========================================================
+
+        # Filtro de arestas Delaunay por comprimento (mediana + k*MAD).
+        # Descarta arestas "atravessadoras" que conectam clusters
+        # distantes pela borda da malha de Delaunay. Use 0 para desativar.
+        # Valores típicos: 2.0 (rigoroso), 2.5 (padrão), 3.5 (permissivo).
+        param_kmad = QgsProcessingParameterNumber(
+            self.FILTRO_K_MAD,
+            self.tr('Filtro de arestas longas — multiplicador k do MAD '
+                    '(0 = desativar)'),
+            type=QgsProcessingParameterNumber.Double,
+            defaultValue=2.5,
+            minValue=0.0,
+            maxValue=10.0,
+            optional=True,
+        )
+        param_kmad.setFlags(
+            param_kmad.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(param_kmad)
+
+        # Validação Voronoi: para cada ponto-limite, verifica se ele está
+        # mais próximo do não-contaminado do par do que de qualquer outro
+        # não-contaminado. Se cair mais perto de outro, a aresta é
+        # descartada (espúria — outro não-contaminado já delimita ali).
+        param_vor = QgsProcessingParameterBoolean(
+            self.VALIDAR_VORONOI,
+            self.tr('Validar pontos-limite por proximidade Voronoi '
+                    '(recomendado: ativo)'),
+            defaultValue=True,
+        )
+        param_vor.setFlags(
+            param_vor.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(param_vor)
+
+        # Método de fechamento do polígono.
+        # 0 = ordenamento angular por centroide (compatível rv1)
+        # 1 = concave hull / alpha shape (mais natural para plumas
+        #     alongadas ou côncavas; usa native:concavehull do QGIS)
+        param_met = QgsProcessingParameterEnum(
+            self.METODO_FECHAMENTO,
+            self.tr('Método de fechamento do polígono'),
+            options=METODOS_FECHAMENTO,
+            defaultValue=0,
+        )
+        param_met.setFlags(
+            param_met.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(param_met)
+
+        # Alpha do concave hull (apenas se método = concave hull).
+        # Range 0.0–1.0 onde 1.0 = convex hull (sem concavidade) e
+        # valores menores produzem hulls progressivamente mais côncavos.
+        # Padrão 0.3 oferece bom equilíbrio entre fidelidade e suavidade.
+        param_alpha = QgsProcessingParameterNumber(
+            self.CONCAVE_ALPHA,
+            self.tr('Alpha do Concave Hull (0,1 = muito côncavo; '
+                    '1,0 = convex hull)'),
+            type=QgsProcessingParameterNumber.Double,
+            defaultValue=0.3,
+            minValue=0.05,
+            maxValue=1.0,
+            optional=True,
+        )
+        param_alpha.setFlags(
+            param_alpha.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(param_alpha)
+
+        # Buffer fallback: quando um grupo gerar <3 pontos-limite, em vez
+        # de descartar, gera um buffer ao redor do(s) ponto(s) contaminado(s).
+        # Útil para investigações subdimensionadas (1 cont. + 2 não-cont.).
+        # NÃO é uma pluma normativa — é representação cartográfica honesta.
+        param_buf = QgsProcessingParameterBoolean(
+            self.BUFFER_FALLBACK,
+            self.tr('Gerar buffer ao redor de contaminados quando '
+                    '<3 pontos-limite (representação aproximada)'),
+            defaultValue=False,
+        )
+        param_buf.setFlags(
+            param_buf.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(param_buf)
+
+        # Fator do raio do buffer fallback. Multiplicador da distância
+        # média do contaminado aos não-contaminados do grupo.
+        #   0.5 = metade da distância média (representação conservadora)
+        #   0.75 = compatível com a regra 75%
+        param_buffat = QgsProcessingParameterNumber(
+            self.BUFFER_FATOR,
+            self.tr('Buffer fallback — fator do raio (0,5 a 0,75)'),
+            type=QgsProcessingParameterNumber.Double,
+            defaultValue=0.5,
+            minValue=0.1,
+            maxValue=0.95,
+            optional=True,
+        )
+        param_buffat.setFlags(
+            param_buffat.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(param_buffat)
+
+        # =========================================================
+        # PARÂMETROS rv3 — EXTRAPOLAÇÃO DE PLUMAS ABERTAS
+        # =========================================================
+        #
+        # Quando contaminados aparecem na BORDA EXTERNA da malha
+        # amostral (sem não-contaminados "do outro lado"), a delimitação
+        # não foi fechada. Em GAC isso indica que novos poços precisam
+        # ser instalados. A extrapolação representa visualmente essa
+        # parte ESTIMADA da pluma com sinalização explícita nas saídas.
+        #
+        # ATENÇÃO REGULATÓRIA: a parte extrapolada NÃO tem evidência
+        # amostral direta. É representação cartográfica para comunicar
+        # a necessidade de campanha adicional.
+
+        # Toggle principal — visível ao iniciante para decisão consciente.
+        # NÃO é avançado de propósito: a decisão de extrapolar tem peso
+        # técnico/regulatório e não deve ser "default escondido".
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                self.EXTRAPOLAR_PLUMAS_ABERTAS,
+                self.tr('Extrapolar plumas abertas '
+                        '(quando contaminados estão na borda da malha)'),
+                defaultValue=False,
+            )
+        )
+
+        # Fator multiplicador da mediana das distâncias do contaminado
+        # de borda aos seus vizinhos não-contaminados Delaunay.
+        # Determina quão "longe" da borda os pontos virtuais são gerados.
+        #   1.0 = distância equivalente à do espaçamento amostral local
+        #         (CONSERVADOR — recomendado para fim regulatório)
+        #   1.5 = uma vez e meia a distância amostral
+        #   2.0 = expansionista — alerta forte sobre extensão potencial
+        param_extdist = QgsProcessingParameterNumber(
+            self.EXTRAPOLAR_FATOR_DISTANCIA,
+            self.tr('Extrapolação — fator de distância (× mediana das '
+                    'distâncias amostrais locais)'),
+            type=QgsProcessingParameterNumber.Double,
+            defaultValue=1.0,
+            minValue=0.5,
+            maxValue=3.0,
+            optional=True,
+        )
+        param_extdist.setFlags(
+            param_extdist.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(param_extdist)
+
+        # Gap angular mínimo (em graus) para considerar um contaminado
+        # como sendo de borda (rv4). É o ÚNICO critério de detecção:
+        # se há um setor angular maior que θ° entre vizinhos Delaunay
+        # do contaminado, ele é considerado de borda.
+        #
+        # Sensibilidade do parâmetro:
+        #   60°  = muito permissivo (detecta com vizinhança ligeiramente
+        #          desbalanceada; risco de falsos positivos)
+        #   90°  = padrão — equivale a "1/4 do círculo sem amostragem"
+        #   110° = conservador — quase um terço do círculo sem amostragem
+        #   135° = muito conservador — só pontos com forte assimetria
+        #   180° = limite teórico (metade do círculo sem amostragem)
+        param_gap = QgsProcessingParameterNumber(
+            self.EXTRAPOLAR_GAP_ANGULAR_GRAUS,
+            self.tr('Extrapolação — gap angular mínimo em graus '
+                    '(threshold de detecção de borda)'),
+            type=QgsProcessingParameterNumber.Double,
+            defaultValue=90.0,
+            minValue=60.0,
+            maxValue=180.0,
+            optional=True,
+        )
+        param_gap.setFlags(
+            param_gap.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(param_gap)
+
+        # Modo avançado: gerar 2 features por pluma quando há
+        # extrapolação — uma com a parte real, outra com a parte estimada.
+        # Permite simbologia diferente no QGIS (ex: hachura na estimada).
+        param_extsep = QgsProcessingParameterBoolean(
+            self.EXTRAPOLAR_GERAR_POLIGONO_SEPARADO,
+            self.tr('Extrapolação — gerar polígono SEPARADO para a parte '
+                    'estimada (avançado)'),
+            defaultValue=False,
+        )
+        param_extsep.setFlags(
+            param_extsep.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(param_extsep)
+
+        # Saídas
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                self.OUTPUT_POLIGONOS,
+                self.tr('Polígonos de delimitação'),
+                QgsProcessing.TypeVectorPolygon,
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                self.OUTPUT_PONTOS_LIMITE,
+                self.tr('Pontos-limite'),
+                QgsProcessing.TypeVectorPoint,
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterFeatureSink(
+                self.OUTPUT_LINHAS,
+                self.tr('Linhas de conexão (auxiliar)'),
+                QgsProcessing.TypeVectorLine,
+                optional=True,
+                createByDefault=False,
+            )
+        )
+
+    # ==================================================================
+    # MÉTODO PRINCIPAL
+    # ==================================================================
+
+    def processAlgorithm(self, parameters, context, feedback):
+
+        # ---------- 1. LEITURA E VALIDAÇÃO DOS PARÂMETROS -----------------
+        source = self.parameterAsSource(parameters, self.INPUT, context)
+        if source is None:
+            raise QgsProcessingException(self.tr('Camada de entrada inválida.'))
+
+        use_selected = self.parameterAsBool(parameters, self.USE_SELECTED, context)
+
+        f_id = self.parameterAsString(parameters, self.FIELD_ID, context)
+        f_contam = self.parameterAsString(parameters, self.FIELD_CONTAMINANTE, context)
+        f_conc = self.parameterAsString(parameters, self.FIELD_CONCENTRACAO, context)
+        f_vi = self.parameterAsString(parameters, self.FIELD_VI, context)
+        f_grupos = self.parameterAsFields(parameters, self.FIELDS_GRUPO, context) or []
+
+        regra_idx = self.parameterAsEnum(parameters, self.REGRA, context)
+        modo_saida_idx = self.parameterAsEnum(parameters, self.MODO_SAIDA, context)
+        gerar_linhas = self.parameterAsBool(parameters, self.GERAR_LINHAS, context)
+
+        # rv1 — parâmetros de suavização
+        suavizar = self.parameterAsBool(parameters, self.SUAVIZAR, context)
+        suav_iter = self.parameterAsInt(parameters, self.SUAVIZAR_ITERACOES, context)
+        suav_offset = self.parameterAsDouble(parameters, self.SUAVIZAR_OFFSET, context)
+
+        # rv4 — método de suavização e subdivisões
+        metodo_suav_idx = self.parameterAsEnum(
+            parameters, self.METODO_SUAVIZACAO, context)
+        suav_subdiv = self.parameterAsInt(
+            parameters, self.SUAVIZAR_SUBDIVISOES, context)
+        suav_tensao = self.parameterAsDouble(
+            parameters, self.SUAVIZAR_TENSAO, context)
+
+        # rv2 — parâmetros de filtros e validações
+        filtro_k_mad = self.parameterAsDouble(parameters, self.FILTRO_K_MAD, context)
+        validar_voronoi = self.parameterAsBool(parameters, self.VALIDAR_VORONOI, context)
+        metodo_fech_idx = self.parameterAsEnum(parameters, self.METODO_FECHAMENTO, context)
+        concave_alpha = self.parameterAsDouble(parameters, self.CONCAVE_ALPHA, context)
+        buffer_fallback = self.parameterAsBool(parameters, self.BUFFER_FALLBACK, context)
+        buffer_fator = self.parameterAsDouble(parameters, self.BUFFER_FATOR, context)
+
+        # rv3 — parâmetros de extrapolação de plumas abertas
+        extrapolar = self.parameterAsBool(
+            parameters, self.EXTRAPOLAR_PLUMAS_ABERTAS, context)
+        extrap_fator = self.parameterAsDouble(
+            parameters, self.EXTRAPOLAR_FATOR_DISTANCIA, context)
+        extrap_separar = self.parameterAsBool(
+            parameters, self.EXTRAPOLAR_GERAR_POLIGONO_SEPARADO, context)
+
+        # rv4 — gap angular para detecção de borda
+        extrap_gap_graus = self.parameterAsDouble(
+            parameters, self.EXTRAPOLAR_GAP_ANGULAR_GRAUS, context)
+
+        fracao = FRACAO_POR_REGRA[regra_idx]
+        regra_label = REGRAS[regra_idx]
+
+        if suavizar:
+            metodo_suav_label = METODOS_SUAVIZACAO[metodo_suav_idx]
+            if metodo_suav_idx == 0:
+                # Catmull-Rom
+                feedback.pushInfo(self.tr(
+                    'Suavização ATIVA — {} com {} subdivisões por aresta '
+                    'e tensão {:.2f}.'
+                ).format(metodo_suav_label, suav_subdiv, suav_tensao))
+            else:
+                # Chaikin
+                feedback.pushInfo(self.tr(
+                    'Suavização ATIVA — {} com {} iterações, offset {:.2f}.'
+                ).format(metodo_suav_label, suav_iter, suav_offset))
+        else:
+            feedback.pushInfo(self.tr('Suavização DESATIVADA.'))
+
+        # Log dos parâmetros rv2
+        feedback.pushInfo(self.tr(
+            'Filtro de arestas longas: k×MAD = {} {}'
+        ).format(filtro_k_mad,
+                 '(DESATIVADO)' if filtro_k_mad <= 0 else ''))
+        feedback.pushInfo(self.tr(
+            'Validação Voronoi: {}'
+        ).format('ATIVA' if validar_voronoi else 'DESATIVADA'))
+        feedback.pushInfo(self.tr(
+            'Método de fechamento: {}'
+        ).format(METODOS_FECHAMENTO[metodo_fech_idx]))
+        if metodo_fech_idx == 1:
+            feedback.pushInfo(self.tr('  alpha = {:.2f}').format(concave_alpha))
+        feedback.pushInfo(self.tr(
+            'Buffer fallback (<3 pontos-limite): {}'
+        ).format('ATIVO (fator={})'.format(buffer_fator)
+                 if buffer_fallback else 'DESATIVADO'))
+
+        if extrapolar:
+            feedback.pushInfo(self.tr(
+                'EXTRAPOLAÇÃO de plumas abertas: ATIVA '
+                '(gap angular mínimo = {:.0f}°; fator de distância = {:.2f}; '
+                'polígonos separados: {}). '
+                'ATENÇÃO: parte extrapolada NÃO tem evidência amostral.'
+            ).format(extrap_gap_graus, extrap_fator,
+                     'sim' if extrap_separar else 'não'))
+        else:
+            feedback.pushInfo(self.tr(
+                'Extrapolação de plumas abertas: DESATIVADA.'))
+
+        # Validação tipo geométrico
+        if QgsWkbTypes.geometryType(source.wkbType()) != QgsWkbTypes.PointGeometry:
+            raise QgsProcessingException(
+                self.tr('A camada de entrada deve ser do tipo PONTO.')
+            )
+
+        # Validação CRS — exige projetado (metros)
+        crs = source.sourceCrs()
+        if not crs.isValid():
+            raise QgsProcessingException(self.tr('CRS da camada inválido.'))
+        if crs.isGeographic():
+            raise QgsProcessingException(
+                self.tr(
+                    'CRS geográfico detectado ({}). Use uma camada em CRS '
+                    'PROJETADO (metros), por exemplo SIRGAS 2000 / UTM '
+                    '(EPSG:31978–31985) ou Web Mercator. Reprojete a camada '
+                    'antes de executar este algoritmo.'
+                ).format(crs.authid())
+            )
+
+        feedback.pushInfo(self.tr('CRS de trabalho: {} ({})').format(
+            crs.authid(), crs.description()))
+
+        # ---------- 2. SELEÇÃO DAS FEIÇÕES A PROCESSAR --------------------
+        # Se USE_SELECTED, o source já vem com seleção aplicada quando o
+        # usuário marca "Processar apenas feições selecionadas" no diálogo
+        # nativo. Mas como expusemos um booleano explícito, tratamos via
+        # objeto source.materialize / getFeatures normais. Quando o usuário
+        # define a camada de entrada via parâmetro do tipo FeatureSource e
+        # marca "Selecionados" no botão da UI, o source já está filtrado.
+        # O parâmetro USE_SELECTED reforça/explicita a intenção em scripts
+        # acionados via API.
+        request = QgsFeatureRequest()
+        if use_selected:
+            # Quando chamado da UI com camada vetorial, o source tem
+            # selectedFeatureCount; em modo source-genérico não há acesso
+            # direto à seleção, então emitimos aviso.
+            feedback.pushInfo(self.tr(
+                '> Modo "apenas selecionados" ativado. '
+                'Verifique no diálogo se a opção "Selected features only" '
+                'está marcada na camada de entrada.'))
+
+        total_feicoes = source.featureCount()
+        if total_feicoes == 0:
+            raise QgsProcessingException(
+                self.tr('Nenhuma feição disponível para processamento.')
+            )
+
+        feedback.pushInfo(self.tr('Total de feições a processar: {}').format(total_feicoes))
+
+        # ---------- 3. LEITURA E CLASSIFICAÇÃO DOS PONTOS -----------------
+        #
+        # CLASSIFICAÇÃO:
+        #   conc > VI         -> CONTAMINADO
+        #   conc <= VI        -> NÃO CONTAMINADO
+        #   conc == 0         -> tratado como NÃO CONTAMINADO
+        #                       (representa LD/LQ ou ausência detectável)
+        #   conc nula / VI nulo / geometria ausente / contaminante vazio
+        #                     -> registro IGNORADO + sinalização
+        #
+        registros = []      # lista de dicts com dados validados
+        ignorados = 0
+        zerados = 0
+        geometrias_invalidas = 0
+
+        # determinar nome efetivo de id (se não informado, usa $id)
+        id_field_name = f_id if f_id else None
+
+        for feat in source.getFeatures(request):
+            if feedback.isCanceled():
+                return {}
+
+            geom = feat.geometry()
+            if geom is None or geom.isEmpty():
+                ignorados += 1
+                continue
+            if not geom.isGeosValid():
+                geometrias_invalidas += 1
+                # tentar reparar
+                geom = geom.makeValid()
+                if geom is None or geom.isEmpty():
+                    ignorados += 1
+                    continue
+
+            # ponto (multipoint -> usa primeiro vértice)
+            if geom.isMultipart():
+                pts = geom.asMultiPoint()
+                if not pts:
+                    ignorados += 1
+                    continue
+                pt = pts[0]
+            else:
+                pt = geom.asPoint()
+
+            contam = feat[f_contam] if f_contam else None
+            conc = feat[f_conc] if f_conc else None
+            vi = feat[f_vi] if f_vi else None
+
+            # Validação básica
+            if contam in (None, '', QVariant()):
+                ignorados += 1
+                continue
+            try:
+                conc_v = float(conc) if conc not in (None, '', QVariant()) else None
+                vi_v = float(vi) if vi not in (None, '', QVariant()) else None
+            except (TypeError, ValueError):
+                ignorados += 1
+                continue
+
+            if conc_v is None or vi_v is None:
+                ignorados += 1
+                continue
+
+            # Classificação
+            # OBS: conc == 0 -> tratado como NÃO contaminado.
+            if conc_v == 0:
+                zerados += 1
+                contaminado = False
+            else:
+                contaminado = (conc_v > vi_v)
+
+            # ID do ponto
+            if id_field_name:
+                pid = feat[id_field_name]
+                if pid in (None, '', QVariant()):
+                    pid = f'fid_{feat.id()}'
+                else:
+                    pid = str(pid)
+            else:
+                pid = f'fid_{feat.id()}'
+
+            # Chave de grupo: contaminante + valores dos campos opcionais
+            grupo_vals = [str(contam)]
+            for fg in f_grupos:
+                v = feat[fg]
+                grupo_vals.append('' if v in (None, QVariant()) else str(v))
+            chave_grupo = ' | '.join(grupo_vals)
+
+            registros.append({
+                'pid': pid,
+                'contaminante': str(contam),
+                'conc': conc_v,
+                'vi': vi_v,
+                'contaminado': contaminado,
+                'chave_grupo': chave_grupo,
+                'pt': QgsPointXY(pt.x(), pt.y()),
+                'fid': feat.id(),
+            })
+
+        feedback.pushInfo(self.tr('Registros válidos: {}').format(len(registros)))
+        if ignorados:
+            feedback.pushWarning(self.tr(
+                'Registros ignorados (geometria/concentração/VI/contaminante '
+                'inválidos): {}').format(ignorados))
+        if zerados:
+            feedback.pushInfo(self.tr(
+                '> {} ponto(s) com concentração igual a zero foram tratados '
+                'como NÃO CONTAMINADOS (LD/LQ).').format(zerados))
+        if geometrias_invalidas:
+            feedback.pushWarning(self.tr(
+                '{} geometria(s) de entrada foram reparadas via makeValid().'
+            ).format(geometrias_invalidas))
+
+        if not registros:
+            raise QgsProcessingException(
+                self.tr('Nenhum registro válido após a triagem inicial.')
+            )
+
+        # ---------- 4. AGRUPAMENTO ---------------------------------------
+        grupos = defaultdict(list)
+        for r in registros:
+            grupos[r['chave_grupo']].append(r)
+
+        feedback.pushInfo(self.tr('Total de grupos formados: {}').format(len(grupos)))
+
+        # ---------- 5. PREPARAÇÃO DAS SINKS DE SAÍDA ---------------------
+        # Campos da camada de polígonos
+        fields_pol = QgsFields()
+        fields_pol.append(QgsField('grupo', QVariant.String, len=255))
+        fields_pol.append(QgsField('contaminante', QVariant.String, len=120))
+        fields_pol.append(QgsField('regra', QVariant.String, len=80))
+        fields_pol.append(QgsField('fracao', QVariant.Double))
+        fields_pol.append(QgsField('n_pontos_cont', QVariant.Int))
+        fields_pol.append(QgsField('n_pontos_nao_cont', QVariant.Int))
+        fields_pol.append(QgsField('n_pontos_limite', QVariant.Int))
+        fields_pol.append(QgsField('conc_max', QVariant.Double))
+        fields_pol.append(QgsField('ref_legal', QVariant.Double))
+        fields_pol.append(QgsField('area_m2', QVariant.Double))
+        fields_pol.append(QgsField('metodo_fechamento', QVariant.String, len=120))
+        # rv3 — sinalização de extrapolação
+        fields_pol.append(QgsField('tem_extrapolacao', QVariant.Int))  # 0/1
+        fields_pol.append(QgsField('subtipo', QVariant.String, len=20))  # real/estimada/completa
+        fields_pol.append(QgsField('observacao', QVariant.String, len=2000))
+
+        (sink_pol, dest_pol_id) = self.parameterAsSink(
+            parameters, self.OUTPUT_POLIGONOS, context,
+            fields_pol, QgsWkbTypes.Polygon, crs)
+        if sink_pol is None:
+            raise QgsProcessingException(
+                self.tr('Falha ao criar a saída de polígonos.'))
+
+        # Campos da camada de pontos-limite
+        fields_lim = QgsFields()
+        fields_lim.append(QgsField('grupo', QVariant.String, len=255))
+        fields_lim.append(QgsField('contaminante', QVariant.String, len=120))
+        fields_lim.append(QgsField('id_cont', QVariant.String, len=80))
+        fields_lim.append(QgsField('id_nao_cont', QVariant.String, len=80))
+        fields_lim.append(QgsField('conc_cont', QVariant.Double))
+        fields_lim.append(QgsField('conc_nao_cont', QVariant.Double))
+        fields_lim.append(QgsField('ref_legal', QVariant.Double))
+        fields_lim.append(QgsField('regra', QVariant.String, len=80))
+        fields_lim.append(QgsField('fracao', QVariant.Double))
+        # rv3 — tipo: 'real' ou 'extrapolado'
+        fields_lim.append(QgsField('tipo', QVariant.String, len=20))
+        fields_lim.append(QgsField('observacao', QVariant.String, len=500))
+
+        (sink_lim, dest_lim_id) = self.parameterAsSink(
+            parameters, self.OUTPUT_PONTOS_LIMITE, context,
+            fields_lim, QgsWkbTypes.Point, crs)
+        if sink_lim is None:
+            raise QgsProcessingException(
+                self.tr('Falha ao criar a saída de pontos-limite.'))
+
+        # Campos da camada de linhas (opcional)
+        sink_lin = None
+        dest_lin_id = None
+        if gerar_linhas:
+            fields_lin = QgsFields()
+            fields_lin.append(QgsField('grupo', QVariant.String, len=255))
+            fields_lin.append(QgsField('contaminante', QVariant.String, len=120))
+            fields_lin.append(QgsField('id_cont', QVariant.String, len=80))
+            fields_lin.append(QgsField('id_nao_cont', QVariant.String, len=80))
+            fields_lin.append(QgsField('conc_cont', QVariant.Double))
+            fields_lin.append(QgsField('conc_nao_cont', QVariant.Double))
+            fields_lin.append(QgsField('ref_legal', QVariant.Double))
+            fields_lin.append(QgsField('comprimento_m', QVariant.Double))
+
+            (sink_lin, dest_lin_id) = self.parameterAsSink(
+                parameters, self.OUTPUT_LINHAS, context,
+                fields_lin, QgsWkbTypes.LineString, crs)
+
+        # ---------- 6. PROCESSAMENTO POR GRUPO ----------------------------
+        n_grupos = len(grupos)
+        for i, (chave, regs_grp) in enumerate(grupos.items()):
+            if feedback.isCanceled():
+                return {}
+            feedback.setProgress(int(100 * i / max(n_grupos, 1)))
+            feedback.pushInfo(self.tr('--- Processando grupo: {} ---').format(chave))
+            feedback.pushInfo(self.tr('  pontos no grupo: {}').format(len(regs_grp)))
+
+            self._processar_grupo(
+                regs_grp, chave, regra_label, fracao, modo_saida_idx,
+                sink_pol, sink_lim, sink_lin, gerar_linhas,
+                context, feedback, crs,
+                suavizar, metodo_suav_idx, suav_subdiv, suav_tensao,
+                suav_iter, suav_offset,
+                # rv2
+                filtro_k_mad, validar_voronoi,
+                metodo_fech_idx, concave_alpha,
+                buffer_fallback, buffer_fator,
+                # rv3 + rv4
+                extrapolar, extrap_fator, extrap_separar, extrap_gap_graus,
+            )
+
+        feedback.setProgress(100)
+
+        # ---------- 7. RETORNO -------------------------------------------
+        results = {
+            self.OUTPUT_POLIGONOS: dest_pol_id,
+            self.OUTPUT_PONTOS_LIMITE: dest_lim_id,
+        }
+        if dest_lin_id is not None:
+            results[self.OUTPUT_LINHAS] = dest_lin_id
+        return results
+
+    # ==================================================================
+    # PROCESSAMENTO DE UM GRUPO
+    # ==================================================================
+
+    def _processar_grupo(self, regs, chave_grupo, regra_label, fracao,
+                         modo_saida_idx, sink_pol, sink_lim, sink_lin,
+                         gerar_linhas, context, feedback, crs,
+                         suavizar, metodo_suav_idx, suav_subdiv, suav_tensao,
+                         suav_iter, suav_offset,
+                         filtro_k_mad, validar_voronoi,
+                         metodo_fech_idx, concave_alpha,
+                         buffer_fallback, buffer_fator,
+                         extrapolar, extrap_fator, extrap_separar,
+                         extrap_gap_graus):
+        """
+        Para um grupo (rv2):
+          1. Separa contaminados / não contaminados
+          2. Constrói triangulação de Delaunay
+          3. FILTRA arestas longas (mediana + k×MAD)         [rv2]
+          4. Filtra pares contaminado<->não-contaminado
+          5. Calcula pontos-limite
+          6. VALIDA pontos-limite por Voronoi                [rv2]
+          7. Identifica plumas (componentes conexas)
+          8. Para cada pluma:
+                a. Constrói polígono (angular ou concave hull) [rv2]
+                b. Aplica suavização Chaikin (se ativa)
+                c. VALIDA não-contaminados internos          [rv2]
+                d. BUFFER FALLBACK se <3 pontos-limite       [rv2]
+                e. Grava sinks com observação verbosa
+        """
+        contaminantes_unicos = sorted({r['contaminante'] for r in regs})
+        contaminante_label = ' / '.join(contaminantes_unicos) \
+            if len(contaminantes_unicos) > 1 else contaminantes_unicos[0]
+
+        cont = [r for r in regs if r['contaminado']]
+        nao_cont = [r for r in regs if not r['contaminado']]
+
+        feedback.pushInfo(
+            self.tr('  contaminados: {} | não contaminados: {}').format(
+                len(cont), len(nao_cont)))
+
+        if not cont:
+            feedback.pushWarning(self.tr(
+                '  > Grupo "{}" sem pontos contaminados — sem delimitação.'
+            ).format(chave_grupo))
+            return
+        if not nao_cont:
+            feedback.pushWarning(self.tr(
+                '  > Grupo "{}" sem pontos não contaminados — não é '
+                'possível delimitar a borda da pluma. Este grupo requer '
+                'investigação adicional para fechar a delimitação.'
+            ).format(chave_grupo))
+            return
+        if len(regs) < 3:
+            feedback.pushWarning(self.tr(
+                '  > Grupo "{}" com menos de 3 pontos — Delaunay não '
+                'aplicável.'
+            ).format(chave_grupo))
+            return
+
+        # Lista de mensagens de auditoria por grupo (verboso)
+        # Cada mensagem documenta uma decisão de descarte/inclusão e os
+        # IDs dos pontos envolvidos. Vai para a coluna 'observacao'.
+        obs_grupo = []
+
+        # ----- (a) Triangulação de Delaunay -----------------------------
+        arestas_delaunay = self._delaunay_arestas(regs, context, feedback, crs)
+
+        if not arestas_delaunay:
+            feedback.pushWarning(self.tr(
+                '  > Triangulação de Delaunay não retornou arestas '
+                '(possível colinearidade ou poucos pontos). Usando '
+                'fallback: contaminado <-> não contaminado mais próximo.'))
+            arestas_delaunay = self._fallback_vizinho_proximo(regs)
+            obs_grupo.append('Delaunay falhou; usado fallback de vizinho '
+                             'mais próximo.')
+
+        # ----- (a.2) FILTRO DE ARESTAS LONGAS (rv2) ---------------------
+        # Calcula mediana e MAD dos comprimentos de aresta da malha de
+        # Delaunay e descarta arestas mais longas que (mediana + k×MAD).
+        # Esse filtro remove "atravessadores" — arestas que conectam
+        # clusters separados por um corredor de pontos intermediários,
+        # mas que aparecem na triangulação por serem topologicamente
+        # vizinhas (compartilham circuncírculo).
+        if filtro_k_mad > 0 and len(arestas_delaunay) >= 5:
+            arestas_delaunay, descartadas_mad, info_mad = \
+                self._filtrar_arestas_por_mad(
+                    arestas_delaunay, regs, filtro_k_mad)
+            if descartadas_mad:
+                feedback.pushInfo(self.tr(
+                    '  filtro k×MAD: {} arestas descartadas '
+                    '(mediana={:.1f}m, MAD={:.1f}m, limite={:.1f}m).'
+                ).format(len(descartadas_mad),
+                         info_mad['mediana'], info_mad['mad'],
+                         info_mad['limite']))
+                # Verboso: registrar pares descartados
+                pares_str = []
+                for ia, ib, comp in descartadas_mad[:10]:
+                    pares_str.append(
+                        '{}↔{} ({:.1f}m)'.format(
+                            regs[ia]['pid'], regs[ib]['pid'], comp))
+                tail = '...' if len(descartadas_mad) > 10 else ''
+                obs_grupo.append(
+                    'Filtro k×MAD descartou {} aresta(s) Delaunay (limite '
+                    '{:.1f} m): {}{}'.format(
+                        len(descartadas_mad), info_mad['limite'],
+                        '; '.join(pares_str), tail))
+
+        # ----- (b) Filtrar arestas contaminado <-> não contaminado ------
+        pares = []  # (idx_cont_no_regs, idx_naocont_no_regs)
+        for ia, ib in arestas_delaunay:
+            ra, rb = regs[ia], regs[ib]
+            if ra['contaminado'] != rb['contaminado']:
+                if ra['contaminado']:
+                    pares.append((ia, ib))
+                else:
+                    pares.append((ib, ia))
+        # Remover duplicatas
+        pares = list({p for p in pares})
+
+        feedback.pushInfo(self.tr('  arestas contaminado<->não cont.: {}').format(
+            len(pares)))
+
+        if not pares:
+            feedback.pushWarning(self.tr(
+                '  > Nenhuma aresta de Delaunay conecta um ponto contaminado '
+                'a um não contaminado neste grupo. Não há borda computável.'))
+            return
+
+        # ----- (c) Calcular pontos-limite -------------------------------
+        pontos_limite = []
+        for ic, inc in pares:
+            rc = regs[ic]
+            rn = regs[inc]
+            x_lim = rc['pt'].x() + fracao * (rn['pt'].x() - rc['pt'].x())
+            y_lim = rc['pt'].y() + fracao * (rn['pt'].y() - rc['pt'].y())
+            pontos_limite.append({
+                'pt': QgsPointXY(x_lim, y_lim),
+                'rc': rc,
+                'rn': rn,
+                'idx_cont': ic,
+                'idx_nao_cont': inc,
+            })
+
+        # ----- (c.2) VALIDAÇÃO VORONOI (rv2) ----------------------------
+        # Para cada ponto-limite, verifica se ele está mais próximo do
+        # não-contaminado do par do que de qualquer outro não-contaminado.
+        # Se cair MAIS PRÓXIMO de outro não-contaminado, isso significa
+        # que esse outro já delimita a pluma naquela direção e o par
+        # original era espúrio (uma aresta Delaunay "pulando" por cima
+        # de não-contaminados intermediários).
+        if validar_voronoi:
+            pontos_limite_v, descartados_vor = \
+                self._validar_pontos_limite_voronoi(pontos_limite, regs)
+            if descartados_vor:
+                feedback.pushInfo(self.tr(
+                    '  validação Voronoi: {} ponto(s)-limite descartado(s).'
+                ).format(len(descartados_vor)))
+                # Verboso: registrar IDs envolvidos (até 10)
+                str_descartes = []
+                for desc in descartados_vor[:10]:
+                    str_descartes.append(
+                        '{}↔{} (interceptado por {})'.format(
+                            desc['id_cont'], desc['id_nao_cont'],
+                            desc['id_outro_nc']))
+                tail = '...' if len(descartados_vor) > 10 else ''
+                obs_grupo.append(
+                    'Validação Voronoi descartou {} par(es): {}{}'.format(
+                        len(descartados_vor),
+                        '; '.join(str_descartes), tail))
+            pontos_limite = pontos_limite_v
+            # Recalcular 'pares' a partir de pontos_limite filtrados
+            pares = [(pl['idx_cont'], pl['idx_nao_cont'])
+                     for pl in pontos_limite]
+
+        if not pontos_limite:
+            feedback.pushWarning(self.tr(
+                '  > Após validações, não restou nenhum ponto-limite '
+                'válido neste grupo.'))
+            return
+
+        # ----- (d) Gravar pontos-limite REAIS na sink -------------------
+        # rv3: cada ponto-limite agora carrega o atributo 'tipo'.
+        # Reais = calculados a partir de par contaminado/não-contaminado.
+        for pl in pontos_limite:
+            f = QgsFeature()
+            f.setGeometry(QgsGeometry.fromPointXY(pl['pt']))
+            f.setAttributes([
+                chave_grupo,
+                pl['rc']['contaminante'],
+                pl['rc']['pid'],
+                pl['rn']['pid'],
+                pl['rc']['conc'],
+                pl['rn']['conc'],
+                pl['rc']['vi'],
+                regra_label,
+                fracao,
+                'real',
+                '',
+            ])
+            sink_lim.addFeature(f, QgsFeatureSink.FastInsert)
+
+        # ----- (e) Linhas auxiliares (opcional) -------------------------
+        if gerar_linhas and sink_lin is not None:
+            for ic, inc in pares:
+                rc = regs[ic]
+                rn = regs[inc]
+                line_geom = QgsGeometry.fromPolylineXY([rc['pt'], rn['pt']])
+                f = QgsFeature()
+                f.setGeometry(line_geom)
+                f.setAttributes([
+                    chave_grupo, rc['contaminante'],
+                    rc['pid'], rn['pid'],
+                    rc['conc'], rn['conc'], rc['vi'],
+                    line_geom.length(),
+                ])
+                sink_lin.addFeature(f, QgsFeatureSink.FastInsert)
+
+        # ----- (e.2) DETECÇÃO DE CONTAMINADOS DE BORDA (rv4) ------------
+        # rv4 usa critério único: gap angular > θ entre vizinhos Delaunay.
+        # Sem mais convex hull. Logs detalhados por contaminado avaliado.
+        idx_cont_borda = []
+        if extrapolar:
+            idx_cont_borda = self._detectar_contaminados_borda(
+                regs, arestas_delaunay, extrap_gap_graus, feedback)
+            if idx_cont_borda:
+                ids_borda = [regs[i]['pid'] for i in idx_cont_borda]
+                feedback.pushInfo(self.tr(
+                    '  EXTRAPOLAÇÃO: {} contaminado(s) de borda detectado(s): {}'
+                ).format(len(idx_cont_borda), ', '.join(ids_borda)))
+                obs_grupo.append(
+                    'Extrapolação ativada — contaminado(s) de borda: [{}]'
+                    .format(', '.join(ids_borda)))
+            else:
+                feedback.pushInfo(self.tr(
+                    '  EXTRAPOLAÇÃO: nenhum contaminado de borda detectado '
+                    '(nenhum tem gap angular > {:.0f}°).'
+                ).format(extrap_gap_graus))
+
+        # ----- (f) Identificar plumas (componentes conexas) -------------
+        plumas_indices = self._identificar_plumas(
+            regs, arestas_delaunay, modo_saida_idx)
+
+        feedback.pushInfo(self.tr('  plumas identificadas: {}').format(
+            len(plumas_indices)))
+
+        # ----- (g) Para cada pluma: construir polígono ------------------
+        for k, idx_conts_pluma in enumerate(plumas_indices, start=1):
+            set_pluma = set(idx_conts_pluma)
+            pls_pluma = [pl for pl in pontos_limite
+                         if pl['idx_cont'] in set_pluma]
+
+            obs_pluma = list(obs_grupo)  # cópia das observações de grupo
+
+            # ----- EXTRAPOLAÇÃO de plumas abertas (rv3) ----------------
+            # Identificar contaminados de borda DESTA pluma e gerar
+            # pontos-limite virtuais para cada um, no setor angular vazio.
+            pls_pluma_extrap = []
+            tem_extrapolacao = False
+            ids_borda_pluma = []
+
+            if extrapolar:
+                for ic_borda in idx_cont_borda:
+                    if ic_borda not in set_pluma:
+                        continue
+                    pls_virtuais = self._gerar_pontos_virtuais_borda(
+                        ic_borda, regs, arestas_delaunay,
+                        pls_pluma, extrap_fator, feedback)
+                    if pls_virtuais:
+                        pls_pluma_extrap.extend(pls_virtuais)
+                        ids_borda_pluma.append(regs[ic_borda]['pid'])
+
+                if pls_pluma_extrap:
+                    tem_extrapolacao = True
+                    obs_pluma.append(
+                        'EXTRAPOLAÇÃO: {} ponto(s)-limite virtual(is) '
+                        'gerado(s) ao redor de {} contaminado(s) de borda '
+                        '[{}]. ATENÇÃO: parte estimada sem evidência '
+                        'amostral.'.format(
+                            len(pls_pluma_extrap),
+                            len(ids_borda_pluma),
+                            ', '.join(ids_borda_pluma)))
+
+                    # Gravar pontos-limite virtuais na sink (com tipo='extrapolado')
+                    for pl_v in pls_pluma_extrap:
+                        f = QgsFeature()
+                        f.setGeometry(QgsGeometry.fromPointXY(pl_v['pt']))
+                        f.setAttributes([
+                            chave_grupo,
+                            pl_v['rc']['contaminante'],
+                            pl_v['rc']['pid'],
+                            None,  # id_nao_cont não se aplica
+                            pl_v['rc']['conc'],
+                            None,  # conc_nao_cont não se aplica
+                            pl_v['rc']['vi'],
+                            regra_label,
+                            None,  # fração não se aplica
+                            'extrapolado',
+                            'Sem evidência amostral — campanha adicional.',
+                        ])
+                        sink_lim.addFeature(f, QgsFeatureSink.FastInsert)
+
+            # Pontos-limite efetivamente usados na construção do polígono
+            pls_pluma_total = pls_pluma + pls_pluma_extrap
+
+            # ----- BUFFER FALLBACK (rv2) --------------------------------
+            if len(pls_pluma_total) < 3:
+                if buffer_fallback:
+                    geom_buf, obs_buf = self._construir_buffer_fallback(
+                        idx_conts_pluma, regs, fracao, buffer_fator)
+                    if geom_buf is not None:
+                        feedback.pushInfo(self.tr(
+                            '  > Pluma {}: buffer fallback aplicado '
+                            '({} ponto(s)-limite < 3).'
+                        ).format(k, len(pls_pluma_total)))
+                        obs_pluma.append(
+                            'BUFFER FALLBACK: <3 pontos-limite ({}). {}'
+                            .format(len(pls_pluma_total), obs_buf))
+                        self._gravar_poligono(
+                            geom_buf, sink_pol, chave_grupo,
+                            contaminante_label, regra_label, fracao,
+                            len(idx_conts_pluma),
+                            len({pl['idx_nao_cont'] for pl in pls_pluma}),
+                            len(pls_pluma_total),
+                            max([regs[i]['conc'] for i in idx_conts_pluma]),
+                            regs[idx_conts_pluma[0]]['vi'],
+                            'buffer fallback',
+                            tem_extrapolacao,
+                            'completa',
+                            obs_pluma)
+                        continue
+                obs_msg = (
+                    'Pluma {}: menos de 3 pontos-limite ({}) — polígono '
+                    'não construído. Investigação adicional recomendada.'
+                ).format(k, len(pls_pluma_total))
+                feedback.pushWarning(self.tr('  > ' + obs_msg))
+                continue
+
+            # ----- Construção do polígono (com extrapolação se aplicável) -
+            poligono_geom, obs_poligono, metodo_fech = \
+                self._construir_poligono(
+                    pls_pluma_total, regs, idx_conts_pluma,
+                    suavizar, metodo_suav_idx, suav_subdiv, suav_tensao,
+                    suav_iter, suav_offset,
+                    metodo_fech_idx, concave_alpha,
+                    context, feedback)
+
+            if poligono_geom is None or poligono_geom.isEmpty():
+                feedback.pushWarning(self.tr(
+                    '  > Pluma {}: geometria inválida não recuperada.'
+                ).format(k))
+                continue
+
+            if obs_poligono:
+                obs_pluma.append(obs_poligono)
+
+            # ----- VALIDAÇÃO PÓS-CONSTRUÇÃO (rv2) ----------------------
+            ids_nc_internos = self._validar_nao_contaminados_internos(
+                poligono_geom, regs, idx_conts_pluma)
+            if ids_nc_internos:
+                feedback.pushWarning(self.tr(
+                    '  > Pluma {}: {} ponto(s) NÃO-contaminado(s) caíram '
+                    'DENTRO do polígono — verifique manualmente: {}'
+                ).format(k, len(ids_nc_internos),
+                         ', '.join(ids_nc_internos[:8])
+                         + ('...' if len(ids_nc_internos) > 8 else '')))
+                obs_pluma.append(
+                    'ATENÇÃO: {} ponto(s) não-contaminado(s) interno(s) '
+                    'ao polígono final — revisão técnica obrigatória. '
+                    'IDs: [{}]'.format(
+                        len(ids_nc_internos),
+                        ', '.join(ids_nc_internos[:15])
+                        + ('...' if len(ids_nc_internos) > 15 else '')))
+
+            # Atributos finais
+            n_cont_pluma = len(idx_conts_pluma)
+            ids_nc_envolvidos = {pl['idx_nao_cont'] for pl in pls_pluma}
+            n_nao_cont_pluma = len(ids_nc_envolvidos)
+            n_pontos_limite = len(pls_pluma_total)
+
+            concs_pluma = [regs[i]['conc'] for i in idx_conts_pluma]
+            conc_max = max(concs_pluma) if concs_pluma else None
+            ref_legal = regs[next(iter(idx_conts_pluma))]['vi']
+
+            if len(plumas_indices) == 1 and modo_saida_idx == 1:
+                obs_pluma.append(
+                    'Modo "plumas separadas" mas apenas 1 componente '
+                    'conexa foi identificada.')
+
+            # ----- MODO POLÍGONO SEPARADO (rv3, opcional avançado) -----
+            # Quando ativo e há extrapolação, gera DUAS features:
+            # - subtipo "real" com a parte ancorada em pontos-limite reais
+            # - subtipo "estimada" com a diferença geométrica
+            # Caso contrário, grava UMA feature com subtipo "completa".
+            if (extrap_separar and tem_extrapolacao
+                    and len(pls_pluma) >= 3):
+                # Construir polígono APENAS com pls reais (sem virtuais)
+                geom_real, _, _ = self._construir_poligono(
+                    pls_pluma, regs, idx_conts_pluma,
+                    suavizar, metodo_suav_idx, suav_subdiv, suav_tensao,
+                    suav_iter, suav_offset,
+                    metodo_fech_idx, concave_alpha,
+                    context, feedback)
+
+                if geom_real is not None and not geom_real.isEmpty():
+                    # Diferença = parte estimada
+                    geom_estimada = poligono_geom.difference(geom_real)
+                    if geom_estimada is None or geom_estimada.isEmpty():
+                        # Fallback: grava só a completa
+                        self._gravar_poligono(
+                            poligono_geom, sink_pol, chave_grupo,
+                            contaminante_label, regra_label, fracao,
+                            n_cont_pluma, n_nao_cont_pluma, n_pontos_limite,
+                            conc_max, ref_legal, metodo_fech,
+                            tem_extrapolacao, 'completa',
+                            obs_pluma + ['Subtração para gerar parte '
+                                        'estimada falhou — gravada completa.'])
+                    else:
+                        # Grava real + estimada
+                        self._gravar_poligono(
+                            geom_real, sink_pol, chave_grupo,
+                            contaminante_label, regra_label, fracao,
+                            n_cont_pluma, n_nao_cont_pluma, len(pls_pluma),
+                            conc_max, ref_legal, metodo_fech,
+                            0, 'real',
+                            obs_pluma + ['Parte real (ancorada em pontos '
+                                        'amostrais).'])
+                        self._gravar_poligono(
+                            geom_estimada, sink_pol, chave_grupo,
+                            contaminante_label, regra_label, fracao,
+                            len(ids_borda_pluma), 0, len(pls_pluma_extrap),
+                            conc_max, ref_legal, metodo_fech,
+                            1, 'estimada',
+                            obs_pluma + ['Parte ESTIMADA — extrapolação '
+                                        'sem evidência amostral. '
+                                        'Recomenda-se nova campanha.'])
+                else:
+                    # Sem polígono real válido, grava só completa
+                    self._gravar_poligono(
+                        poligono_geom, sink_pol, chave_grupo,
+                        contaminante_label, regra_label, fracao,
+                        n_cont_pluma, n_nao_cont_pluma, n_pontos_limite,
+                        conc_max, ref_legal, metodo_fech,
+                        tem_extrapolacao, 'completa', obs_pluma)
+            else:
+                # Modo padrão: grava UMA feature com subtipo "completa"
+                self._gravar_poligono(
+                    poligono_geom, sink_pol, chave_grupo,
+                    contaminante_label, regra_label, fracao,
+                    n_cont_pluma, n_nao_cont_pluma, n_pontos_limite,
+                    conc_max, ref_legal, metodo_fech,
+                    tem_extrapolacao, 'completa', obs_pluma)
+
+    # ==================================================================
+    # AUXILIAR: gravar feature de polígono na sink
+    # ==================================================================
+
+    def _gravar_poligono(self, geom, sink_pol, chave_grupo, contaminante_label,
+                        regra_label, fracao, n_cont, n_nao_cont, n_pls,
+                        conc_max, ref_legal, metodo_fech,
+                        tem_extrapolacao, subtipo, obs_lista):
+        """
+        Função auxiliar para evitar duplicação de código de gravação.
+        Trunca a observação a 1990 caracteres para caber no campo
+        (capacidade 2000) com folga.
+
+        rv3: agora recebe `tem_extrapolacao` (0/1) e `subtipo`
+        ('real' / 'estimada' / 'completa') para sinalizar plumas com
+        partes extrapoladas.
+        """
+        obs_str = ' | '.join(obs_lista) if obs_lista else ''
+        if len(obs_str) > 1990:
+            obs_str = obs_str[:1985] + '[...]'
+
+        f_pol = QgsFeature()
+        f_pol.setGeometry(geom)
+        f_pol.setAttributes([
+            chave_grupo,
+            contaminante_label,
+            regra_label,
+            fracao,
+            int(n_cont),
+            int(n_nao_cont),
+            int(n_pls),
+            conc_max,
+            ref_legal,
+            geom.area(),
+            metodo_fech,
+            int(1 if tem_extrapolacao else 0),
+            subtipo,
+            obs_str,
+        ])
+        sink_pol.addFeature(f_pol, QgsFeatureSink.FastInsert)
+
+
+    # ==================================================================
+    # DELAUNAY VIA PROCESSING
+    # ==================================================================
+
+    def _delaunay_arestas(self, regs, context, feedback, crs):
+        """
+        Constrói uma triangulação de Delaunay com os pontos do grupo
+        usando o algoritmo nativo 'qgis:delaunaytriangulation' e retorna
+        a lista de arestas únicas como pares (i, j) de índices na lista
+        'regs'.
+
+        Estratégia: criamos uma camada de memória com os pontos do grupo
+        (no CRS original, projetado), rodamos a triangulação, e para cada
+        triângulo de saída casamos seus 3 vértices de volta aos pontos
+        de 'regs' por coordenadas (Delaunay preserva os vértices de
+        entrada exatamente).
+        """
+        from qgis.core import QgsVectorLayer
+        # Camada de memória no CRS real (projetado), preservando coordenadas
+        mem_uri = f'Point?crs={crs.authid()}&field=idx:integer'
+        mem = QgsVectorLayer(mem_uri, 'tmp_pts', 'memory')
+        prov = mem.dataProvider()
+        feats = []
+        for i, r in enumerate(regs):
+            f = QgsFeature()
+            f.setGeometry(QgsGeometry.fromPointXY(r['pt']))
+            f.setAttributes([i])
+            feats.append(f)
+        prov.addFeatures(feats)
+        mem.updateExtents()
+
+        # Rodar Delaunay
+        try:
+            res = processing.run(
+                'qgis:delaunaytriangulation',
+                {'INPUT': mem, 'OUTPUT': 'memory:'},
+                context=context, feedback=feedback, is_child_algorithm=True,
+            )
+            tin_layer = res['OUTPUT']
+        except Exception as e:
+            feedback.pushWarning(self.tr(
+                'Erro ao executar Delaunay nativo: {}').format(str(e)))
+            return []
+
+        # Resolver a saída (pode ser id ou layer)
+        if isinstance(tin_layer, str):
+            tin_layer = QgsProcessingUtils.mapLayerFromString(tin_layer, context)
+
+        if tin_layer is None:
+            return []
+
+        # Indexar pontos de regs por coordenadas (chave arredondada)
+        def _key(p):
+            return (round(p.x(), 6), round(p.y(), 6))
+
+        coord_to_idx = {_key(r['pt']): i for i, r in enumerate(regs)}
+
+        arestas = set()
+        for tri in tin_layer.getFeatures():
+            geom = tri.geometry()
+            if geom is None or geom.isEmpty():
+                continue
+            # Triângulo é um polígono com 4 vértices (3 + fechamento)
+            if geom.isMultipart():
+                rings_list = geom.asMultiPolygon()
+                if not rings_list or not rings_list[0]:
+                    continue
+                ring = rings_list[0][0]
+            else:
+                rings = geom.asPolygon()
+                if not rings:
+                    continue
+                ring = rings[0]
+
+            # ring tem 4 pontos (3 + repetição do primeiro)
+            verts = ring[:-1] if len(ring) >= 4 else ring
+            if len(verts) < 3:
+                continue
+
+            idxs = []
+            for v in verts:
+                k = _key(QgsPointXY(v.x(), v.y()))
+                if k in coord_to_idx:
+                    idxs.append(coord_to_idx[k])
+            if len(idxs) < 3:
+                continue
+
+            # 3 arestas do triângulo
+            for a, b in [(idxs[0], idxs[1]),
+                         (idxs[1], idxs[2]),
+                         (idxs[2], idxs[0])]:
+                if a == b:
+                    continue
+                arestas.add((min(a, b), max(a, b)))
+
+        return list(arestas)
+
+    # ==================================================================
+    # FALLBACK: vizinho mais próximo (caso pontos colineares)
+    # ==================================================================
+
+    def _fallback_vizinho_proximo(self, regs):
+        """
+        Para cada ponto contaminado, conecta ao ponto não contaminado
+        mais próximo. Usado apenas quando a triangulação de Delaunay
+        falha (por ex., 3 pontos colineares ou quantidade insuficiente).
+        Retorna arestas como pares (i, j) de índices em 'regs'.
+        """
+        arestas = set()
+        idx_cont = [i for i, r in enumerate(regs) if r['contaminado']]
+        idx_nao_cont = [i for i, r in enumerate(regs) if not r['contaminado']]
+
+        for ic in idx_cont:
+            pc = regs[ic]['pt']
+            best = None
+            best_d = None
+            for inc in idx_nao_cont:
+                pn = regs[inc]['pt']
+                d = math.hypot(pc.x() - pn.x(), pc.y() - pn.y())
+                if best is None or d < best_d:
+                    best = inc
+                    best_d = d
+            if best is not None:
+                arestas.add((min(ic, best), max(ic, best)))
+
+        return list(arestas)
+
+    # ==================================================================
+    # IDENTIFICAÇÃO DE PLUMAS (componentes conexas)
+    # ==================================================================
+
+    def _identificar_plumas(self, regs, arestas, modo_saida_idx):
+        """
+        Modo 0 (um polígono): retorna [todos_os_indices_contaminados].
+        Modo 1 (plumas separadas): identifica componentes conexas no
+            subgrafo INDUZIDO pelos pontos contaminados, onde dois pontos
+            contaminados são considerados conectados se existe um caminho
+            de Delaunay entre eles passando apenas por outros contaminados.
+
+        Retorna lista de listas de índices (no array regs) de pontos
+        contaminados, uma lista por pluma.
+        """
+        idx_contaminados = [i for i, r in enumerate(regs) if r['contaminado']]
+
+        if modo_saida_idx == 0:
+            # tudo num único grupo
+            return [idx_contaminados] if idx_contaminados else []
+
+        # Modo 1: BFS no subgrafo de contaminados
+        adj = defaultdict(set)
+        set_cont = set(idx_contaminados)
+        for a, b in arestas:
+            if a in set_cont and b in set_cont:
+                adj[a].add(b)
+                adj[b].add(a)
+
+        visitados = set()
+        plumas = []
+        for ini in idx_contaminados:
+            if ini in visitados:
+                continue
+            comp = []
+            fila = deque([ini])
+            visitados.add(ini)
+            while fila:
+                cur = fila.popleft()
+                comp.append(cur)
+                for viz in adj.get(cur, ()):
+                    if viz not in visitados:
+                        visitados.add(viz)
+                        fila.append(viz)
+            plumas.append(comp)
+
+        return plumas
+
+    # ==================================================================
+    # CONSTRUÇÃO DE POLÍGONO (rv2): angular OU concave hull + suavização
+    # ==================================================================
+
+    def _construir_poligono(self, pls_pluma, regs, idx_conts_pluma,
+                            suavizar, metodo_suav_idx, suav_subdiv, suav_tensao,
+                            suav_iter, suav_offset,
+                            metodo_fech_idx, concave_alpha,
+                            context, feedback):
+        """
+        rv4 — Constrói o polígono e aplica suavização escolhida.
+
+        Parâmetros novos rv4:
+            metodo_suav_idx : 0 = Catmull-Rom (interpolador, padrão)
+                              1 = Chaikin (aproximador)
+            suav_subdiv     : número de subdivisões por aresta (Catmull-Rom)
+
+        Retorna (geometry, observacao, metodo_fechamento_str).
+        """
+        pts = [pl['pt'] for pl in pls_pluma]
+
+        if len(pts) < 3:
+            return None, 'Menos de 3 pontos-limite.', 'inválido'
+
+        obs_partes = []
+
+        # ---- (a) Construir polígono base segundo o método selecionado ---
+        if metodo_fech_idx == 1:
+            geom = self._concave_hull_qgis(
+                pls_pluma, regs, idx_conts_pluma, concave_alpha,
+                context, feedback)
+            metodo_base = 'concave hull (alpha={:.2f})'.format(concave_alpha)
+
+            if geom is None or geom.isEmpty():
+                feedback.pushWarning(self.tr(
+                    '    > concave hull falhou — usando ordenamento angular.'))
+                geom = self._poligono_angular(pts)
+                metodo_base = 'angular (fallback de concave hull)'
+                obs_partes.append(
+                    'Concave hull falhou ou retornou vazio — usado '
+                    'ordenamento angular como fallback.')
+        else:
+            geom = self._poligono_angular(pts)
+            metodo_base = 'centroide + ângulo polar'
+
+        if geom is None or geom.isEmpty():
+            return None, ('Falha ao construir polígono base ({}).'
+                          .format(metodo_base)), metodo_base
+
+        # ---- (b) Reparo de geometria base se necessário -----------------
+        if not geom.isGeosValid():
+            obs_partes.append(
+                'Geometria base inválida — reparada via makeValid')
+            geom_rep = geom.makeValid()
+            if geom_rep is not None and not geom_rep.isEmpty():
+                geom = geom_rep
+            else:
+                geom_b = geom.buffer(0, 1)
+                if geom_b is not None and not geom_b.isEmpty():
+                    geom = geom_b
+                    obs_partes[-1] = 'Geometria base reparada via buffer(0)'
+                else:
+                    return (None,
+                            'Geometria inválida e não recuperável '
+                            '(autointersecções complexas).',
+                            metodo_base)
+
+        # ---- (c) SUAVIZAÇÃO — opcional --------------------------------
+        # rv4: escolha entre Catmull-Rom (padrão) e Chaikin
+        metodo_final = metodo_base
+
+        if suavizar:
+            if metodo_suav_idx == 0:
+                # Catmull-Rom — interpolador (Cardinal Spline)
+                geom_suav, obs_suav = self._suavizar_catmull_rom(
+                    geom, suav_subdiv, suav_tensao, feedback)
+                metodo_suav_label = 'Catmull-Rom (subdivs={}, tensão={:.2f})'.format(
+                    suav_subdiv, suav_tensao)
+            else:
+                # Chaikin — aproximador, contrai
+                geom_suav, obs_suav = self._suavizar_chaikin(
+                    geom, suav_iter, suav_offset, feedback)
+                metodo_suav_label = 'Chaikin (iter={}, off={:.2f})'.format(
+                    suav_iter, suav_offset)
+
+            if obs_suav:
+                obs_partes.append(obs_suav)
+
+            if geom_suav is not None and not geom_suav.isEmpty():
+                # Validar: pontos contaminados continuam dentro?
+                pontos_fora = []
+                for ic in idx_conts_pluma:
+                    pt_cont = QgsGeometry.fromPointXY(regs[ic]['pt'])
+                    if not (geom_suav.contains(pt_cont)
+                            or geom_suav.intersects(pt_cont)):
+                        pontos_fora.append(regs[ic]['pid'])
+
+                if pontos_fora:
+                    obs_partes.append(
+                        'Suavização {} excluiu {} ponto(s) contaminado(s) '
+                        '[{}] — mantido polígono original.'.format(
+                            metodo_suav_label,
+                            len(pontos_fora),
+                            ', '.join(pontos_fora[:5])
+                            + ('...' if len(pontos_fora) > 5 else '')
+                        ))
+                else:
+                    geom = geom_suav
+                    metodo_final = '{} + {}'.format(
+                        metodo_base, metodo_suav_label)
+
+        # ---- (d) Validação final ----------------------------------------
+        if not geom.isGeosValid():
+            obs_partes.append(
+                'Geometria final ainda apresenta inconsistências.')
+
+        observacao = ' | '.join(obs_partes)
+        return geom, observacao, metodo_final
+
+    # ------------------------------------------------------------------
+    # SUAVIZAÇÃO CATMULL-ROM (rv4) — interpolador puro Python
+    # ------------------------------------------------------------------
+
+    def _suavizar_catmull_rom(self, geom, subdivisoes, tensao, feedback):
+        """
+        Aplica suavização Cardinal Spline (Catmull-Rom generalizado) ao
+        polígono.
+
+        Algoritmo: para cada aresta P_i → P_(i+1), interpola N pontos
+        usando os 4 vértices consecutivos P_(i-1), P_i, P_(i+1), P_(i+2)
+        com a formulação de Hermite + tangentes Cardinal:
+
+            B(t) = h1(t)·P1 + h2(t)·P2
+                 + h3(t)·c·(P2-P0) + h4(t)·c·(P3-P1)
+
+        Onde os polinômios de Hermite são:
+            h1(t) = 2t³ - 3t² + 1   (passa por P1 em t=0)
+            h2(t) = -2t³ + 3t²       (passa por P2 em t=1)
+            h3(t) = t³ - 2t² + t     (tangente em P1)
+            h4(t) = t³ - t²          (tangente em P2)
+
+        E 'c' é a TENSÃO da curva:
+            c = 0    → curva = polígono original (sem suavização)
+            c = 0.30 → equilíbrio padrão (expansão ~13-15%)
+            c = 0.50 → Catmull-Rom clássico (expansão ~25%)
+            c = 1.00 → curva muito tensa (expansão >30%)
+
+        A curva sempre PASSA pelos vértices originais (interpolador).
+        Quanto maior 'c', mais a curva "abraça os cantos por fora",
+        aumentando a área. Quanto menor, mais a curva fica próxima das
+        arestas originais.
+
+        Retorna (QgsGeometry, observacao_str).
+        """
+        if geom is None or geom.isEmpty():
+            return None, 'Geometria de entrada vazia.'
+
+        # Caso especial: tensão 0 → retorna a geometria original
+        if tensao <= 0.001:
+            return QgsGeometry(geom), 'Tensão zero — sem suavização aplicada.'
+
+        # Extrair anel externo do polígono
+        if geom.isMultipart():
+            rings_list = geom.asMultiPolygon()
+            if not rings_list or not rings_list[0]:
+                return None, 'Polígono multipart sem anéis.'
+            ring = rings_list[0][0]
+        else:
+            rings = geom.asPolygon()
+            if not rings:
+                return None, 'Polígono sem anéis.'
+            ring = rings[0]
+
+        # Anel típico: N+1 pontos com último == primeiro. Removemos o
+        # fechamento para o cálculo (com wrap-around via módulo).
+        if len(ring) >= 2 and ring[0] == ring[-1]:
+            pts = list(ring[:-1])
+        else:
+            pts = list(ring)
+
+        n = len(pts)
+        if n < 3:
+            return None, 'Polígono com menos de 3 vértices únicos.'
+
+        c = float(tensao)
+        new_pts = []
+        for i in range(n):
+            # 4 pontos consecutivos com wrap-around
+            p0 = pts[(i - 1) % n]
+            p1 = pts[i]
+            p2 = pts[(i + 1) % n]
+            p3 = pts[(i + 2) % n]
+
+            # Tangentes (escaladas pela tensão)
+            tan1_x = c * (p2.x() - p0.x())
+            tan1_y = c * (p2.y() - p0.y())
+            tan2_x = c * (p3.x() - p1.x())
+            tan2_y = c * (p3.y() - p1.y())
+
+            # Subdivisões: t = 0, 1/N, 2/N, ..., (N-1)/N
+            for j in range(subdivisoes):
+                t = j / subdivisoes
+                t2 = t * t
+                t3 = t2 * t
+
+                # Polinômios de Hermite
+                h1 = 2 * t3 - 3 * t2 + 1
+                h2 = -2 * t3 + 3 * t2
+                h3 = t3 - 2 * t2 + t
+                h4 = t3 - t2
+
+                x = h1 * p1.x() + h2 * p2.x() + h3 * tan1_x + h4 * tan2_x
+                y = h1 * p1.y() + h2 * p2.y() + h3 * tan1_y + h4 * tan2_y
+                new_pts.append(QgsPointXY(x, y))
+
+        # Fechar anel
+        if new_pts:
+            new_pts.append(new_pts[0])
+
+        # Construir geometria
+        geom_suav = QgsGeometry.fromPolygonXY([new_pts])
+
+        if geom_suav is None or geom_suav.isEmpty():
+            return None, 'Catmull-Rom produziu geometria vazia.'
+
+        if not geom_suav.isGeosValid():
+            geom_rep = geom_suav.makeValid()
+            if geom_rep is not None and not geom_rep.isEmpty():
+                return geom_rep, ('Catmull-Rom: geometria reparada via '
+                                  'makeValid.')
+            return None, 'Catmull-Rom: geometria inválida.'
+
+        return geom_suav, ''
+
+    # ------------------------------------------------------------------
+    # SUAVIZAÇÃO CHAIKIN (encapsulada para uniformidade da API)
+    # ------------------------------------------------------------------
+
+    def _suavizar_chaikin(self, geom, iteracoes, offset, feedback):
+        """
+        Wrapper sobre QgsGeometry.smooth() (Chaikin nativo do PyQGIS).
+        Encapsulado para que _construir_poligono trate ambos os métodos
+        de forma uniforme (mesma assinatura e tratamento de erros).
+        """
+        if geom is None or geom.isEmpty():
+            return None, 'Geometria de entrada vazia.'
+
+        try:
+            geom_suav = geom.smooth(
+                iterations=int(iteracoes),
+                offset=float(offset),
+                minimumDistance=-1.0,
+                maxAngle=180.0,
+            )
+        except Exception as e:
+            return None, 'Erro Chaikin: {}'.format(str(e)[:80])
+
+        if geom_suav is None or geom_suav.isEmpty():
+            return None, 'Chaikin produziu geometria vazia.'
+
+        if not geom_suav.isGeosValid():
+            geom_rep = geom_suav.makeValid()
+            if geom_rep is not None and not geom_rep.isEmpty():
+                return geom_rep, 'Chaikin: geometria reparada via makeValid.'
+            return None, 'Chaikin: geometria inválida.'
+
+        return geom_suav, ''
+
+    # ------------------------------------------------------------------
+    # POLÍGONO POR ORDENAMENTO ANGULAR (auxiliar; isolado para reuso)
+    # ------------------------------------------------------------------
+
+    def _poligono_angular(self, pts):
+        """Constrói polígono ordenando pontos por ângulo polar a partir
+        do centroide. Retorna QgsGeometry ou None."""
+        if len(pts) < 3:
+            return None
+        cx = sum(p.x() for p in pts) / len(pts)
+        cy = sum(p.y() for p in pts) / len(pts)
+
+        def _ang(p):
+            return math.atan2(p.y() - cy, p.x() - cx)
+
+        pts_ord = sorted(pts, key=_ang)
+        ring = pts_ord + [pts_ord[0]]
+        return QgsGeometry.fromPolygonXY([ring])
+
+    # ==================================================================
+    # FUNÇÕES HELPER rv2
+    # ==================================================================
+
+    def _filtrar_arestas_por_mad(self, arestas, regs, k):
+        """
+        Filtro estatístico de arestas Delaunay longas.
+
+        Calcula a mediana e o MAD (Median Absolute Deviation) dos
+        comprimentos de aresta da triangulação. Descarta arestas com
+        comprimento > mediana + k × MAD. Esse limiar é robusto a
+        outliers (ao contrário de média + k × desvio padrão).
+
+        Por que MAD? Em redes amostrais reais, a maioria das arestas
+        tem comprimento similar (espaçamento entre poços vizinhos).
+        Arestas espúrias são poucas mas muito longas — exatamente
+        o cenário onde MAD é superior ao desvio padrão.
+
+        Retorna:
+            (arestas_mantidas, arestas_descartadas, info_dict)
+            - arestas_mantidas: lista de tuplas (i, j) preservadas
+            - arestas_descartadas: lista de (i, j, comprimento)
+            - info_dict: {'mediana':, 'mad':, 'limite':}
+        """
+        # Calcular comprimentos
+        comprimentos = []
+        for ia, ib in arestas:
+            pa = regs[ia]['pt']
+            pb = regs[ib]['pt']
+            d = math.hypot(pa.x() - pb.x(), pa.y() - pb.y())
+            comprimentos.append(d)
+
+        if not comprimentos:
+            return arestas, [], {'mediana': 0, 'mad': 0, 'limite': 0}
+
+        # Mediana e MAD nativos (sem numpy)
+        sorted_c = sorted(comprimentos)
+        n = len(sorted_c)
+        mediana = sorted_c[n // 2] if n % 2 == 1 else \
+            0.5 * (sorted_c[n // 2 - 1] + sorted_c[n // 2])
+        desvios = sorted([abs(c - mediana) for c in comprimentos])
+        mad = desvios[n // 2] if n % 2 == 1 else \
+            0.5 * (desvios[n // 2 - 1] + desvios[n // 2])
+
+        # Limite: mediana + k × MAD. Se MAD = 0 (todas as arestas iguais)
+        # usamos uma fração da mediana como tolerância para evitar
+        # filtrar tudo.
+        if mad == 0:
+            mad = 0.05 * mediana  # 5% como tolerância mínima
+        limite = mediana + k * mad
+
+        info = {'mediana': mediana, 'mad': mad, 'limite': limite}
+
+        mantidas = []
+        descartadas = []
+        for (ia, ib), comp in zip(arestas, comprimentos):
+            if comp <= limite:
+                mantidas.append((ia, ib))
+            else:
+                descartadas.append((ia, ib, comp))
+
+        return mantidas, descartadas, info
+
+    def _validar_pontos_limite_voronoi(self, pontos_limite, regs):
+        """
+        Validação Voronoi dos pontos-limite (rv2).
+
+        Para cada ponto-limite, verifica se o não-contaminado do par
+        é o NÃO-CONTAMINADO MAIS PRÓXIMO desse ponto-limite. Se outro
+        não-contaminado estiver mais próximo, isso indica que a aresta
+        Delaunay original era espúrio: existe um não-contaminado
+        diferente que delimita melhor a pluma naquela direção.
+
+        Geometricamente: o ponto-limite deveria cair dentro da célula
+        de Voronoi do não-contaminado do par. Se cair na célula de
+        outro não-contaminado, descartar.
+
+        Retorna:
+            (pontos_limite_mantidos, descartes_info)
+            descartes_info: lista de dicts com IDs envolvidos.
+        """
+        # Coletar todos os não-contaminados (índice em regs)
+        idx_nao_cont_todos = [i for i, r in enumerate(regs)
+                              if not r['contaminado']]
+
+        mantidos = []
+        descartados = []
+
+        for pl in pontos_limite:
+            p = pl['pt']
+            inc_par = pl['idx_nao_cont']
+
+            # Distância ao não-contaminado do par
+            pn_par = regs[inc_par]['pt']
+            d_par = math.hypot(p.x() - pn_par.x(), p.y() - pn_par.y())
+
+            # Buscar não-contaminado mais próximo (excluindo o do par)
+            mais_proximo_idx = None
+            mais_proximo_d = None
+            for inc in idx_nao_cont_todos:
+                if inc == inc_par:
+                    continue
+                pn = regs[inc]['pt']
+                d = math.hypot(p.x() - pn.x(), p.y() - pn.y())
+                if mais_proximo_d is None or d < mais_proximo_d:
+                    mais_proximo_d = d
+                    mais_proximo_idx = inc
+
+            # Decisão: se outro não-cont. está mais próximo, descartar par
+            if (mais_proximo_idx is not None
+                    and mais_proximo_d < d_par):
+                descartados.append({
+                    'id_cont': pl['rc']['pid'],
+                    'id_nao_cont': pl['rn']['pid'],
+                    'id_outro_nc': regs[mais_proximo_idx]['pid'],
+                    'd_par': d_par,
+                    'd_outro': mais_proximo_d,
+                })
+            else:
+                mantidos.append(pl)
+
+        return mantidos, descartados
+
+    def _concave_hull_qgis(self, pls_pluma, regs, idx_conts_pluma,
+                           alpha, context, feedback):
+        """
+        Concave hull (alpha shape) usando algoritmo nativo do QGIS.
+
+        Estratégia:
+            - Cria camada temporária com pontos contaminados + pontos-limite
+            - Roda native:concavehull com alpha (0=máximo côncavo, 1=convexo)
+            - Retorna geometria do hull
+
+        Inclui pontos contaminados como entrada para garantir que eles
+        fiquem dentro do hull mesmo se ele for muito côncavo. Pontos-
+        limite são incluídos para definir a borda.
+        """
+        from qgis.core import QgsVectorLayer
+
+        # Camada de memória — CRS irrelevante para topologia do hull
+        # (é puramente geométrico). Usamos CRS genérico EPSG:3857.
+        mem = QgsVectorLayer('Point?crs=EPSG:3857', 'tmp_hull', 'memory')
+        prov = mem.dataProvider()
+
+        feats = []
+        # Pontos contaminados
+        for ic in idx_conts_pluma:
+            f = QgsFeature()
+            f.setGeometry(QgsGeometry.fromPointXY(regs[ic]['pt']))
+            feats.append(f)
+        # Pontos-limite
+        for pl in pls_pluma:
+            f = QgsFeature()
+            f.setGeometry(QgsGeometry.fromPointXY(pl['pt']))
+            feats.append(f)
+        prov.addFeatures(feats)
+        mem.updateExtents()
+
+        # Tentar native:concavehull primeiro; se não disponível, fallback
+        # para qgis:concavehull (k-nearest)
+        try:
+            res = processing.run(
+                'native:concavehull',
+                {
+                    'INPUT': mem,
+                    'ALPHA': float(alpha),
+                    'HOLES': False,
+                    'NO_MULTIGEOMETRY': True,
+                    'OUTPUT': 'memory:',
+                },
+                context=context, feedback=feedback,
+                is_child_algorithm=True,
+            )
+            hull_layer = res.get('OUTPUT')
+        except Exception as e1:
+            # Fallback: qgis:concavehull (parâmetro é PERCENTAGE 0-1)
+            try:
+                feedback.pushInfo(self.tr(
+                    '    native:concavehull falhou ({}) — '
+                    'tentando qgis:concavehull.').format(str(e1)[:60]))
+                res = processing.run(
+                    'qgis:knearestconcavehull',
+                    {
+                        'INPUT': mem,
+                        'KNEIGHBORS': max(3, len(feats) // 2),
+                        'OUTPUT': 'memory:',
+                    },
+                    context=context, feedback=feedback,
+                    is_child_algorithm=True,
+                )
+                hull_layer = res.get('OUTPUT')
+            except Exception as e2:
+                feedback.pushWarning(self.tr(
+                    '    Concave hull não disponível ({}/{}).').format(
+                    str(e1)[:40], str(e2)[:40]))
+                return None
+
+        # Resolver string -> layer
+        if isinstance(hull_layer, str):
+            hull_layer = QgsProcessingUtils.mapLayerFromString(
+                hull_layer, context)
+        if hull_layer is None:
+            return None
+
+        # Pegar primeira (e única) feature do hull
+        for f in hull_layer.getFeatures():
+            geom = f.geometry()
+            if geom is not None and not geom.isEmpty():
+                return QgsGeometry(geom)
+        return None
+
+    def _validar_nao_contaminados_internos(self, geom, regs, idx_conts_pluma):
+        """
+        Verifica se há pontos NÃO-contaminados deste grupo dentro do
+        polígono final. Esse é o sintoma do problema PM28/PM29: se a
+        suavização (ou o fechamento angular sobre uma malha não-convexa)
+        "engoliu" um não-contaminado que deveria estar fora, isso aparece
+        aqui.
+
+        Retorna lista de IDs (str) dos não-contaminados internos.
+        """
+        if geom is None or geom.isEmpty():
+            return []
+
+        set_cont = set(idx_conts_pluma)
+        ids_internos = []
+
+        for i, r in enumerate(regs):
+            if r['contaminado']:
+                continue
+            if i in set_cont:
+                continue
+            pt_geom = QgsGeometry.fromPointXY(r['pt'])
+            # contains() é estrito (não inclui borda); intersects pega
+            # casos de tangência. Para "interno" estrito usar contains.
+            if geom.contains(pt_geom):
+                ids_internos.append(r['pid'])
+
+        return ids_internos
+
+    def _construir_buffer_fallback(self, idx_conts_pluma, regs,
+                                   fracao, fator):
+        """
+        Buffer fallback para grupos com <3 pontos-limite.
+
+        Calcula um buffer ao redor do(s) ponto(s) contaminado(s) com
+        raio = fator × distância_média_ao_não_contaminado_mais_próximo.
+
+        Lógica:
+            - Para cada contaminado, encontra o não-contaminado mais
+              próximo do mesmo grupo
+            - Calcula a distância média
+            - Aplica buffer com esse raio × fator
+            - Une todos os buffers (se >1 contaminado) e dissolve
+
+        Retorna (geometry, observacao_str).
+        """
+        idx_nao_cont = [i for i, r in enumerate(regs)
+                        if not r['contaminado']]
+
+        if not idx_nao_cont:
+            return None, 'Sem não-contaminados para calcular raio.'
+
+        # Buffer por contaminado, depois união
+        buffers = []
+        raios_calculados = []
+        for ic in idx_conts_pluma:
+            pc = regs[ic]['pt']
+            # distância ao não-contaminado mais próximo
+            d_min = None
+            for inc in idx_nao_cont:
+                pn = regs[inc]['pt']
+                d = math.hypot(pc.x() - pn.x(), pc.y() - pn.y())
+                if d_min is None or d < d_min:
+                    d_min = d
+            if d_min is None or d_min == 0:
+                continue
+            raio = fator * d_min
+            raios_calculados.append(raio)
+            pt_geom = QgsGeometry.fromPointXY(pc)
+            buf = pt_geom.buffer(raio, 36)  # 36 segments p/ círculo suave
+            if buf is not None and not buf.isEmpty():
+                buffers.append(buf)
+
+        if not buffers:
+            return None, 'Falha ao construir buffer ao redor dos contaminados.'
+
+        # União de todos os buffers
+        if len(buffers) == 1:
+            geom_final = buffers[0]
+        else:
+            geom_final = QgsGeometry.unaryUnion(buffers)
+
+        if geom_final is None or geom_final.isEmpty():
+            return None, 'União dos buffers retornou geometria vazia.'
+
+        if not geom_final.isGeosValid():
+            geom_rep = geom_final.makeValid()
+            if geom_rep is not None and not geom_rep.isEmpty():
+                geom_final = geom_rep
+
+        raio_medio = sum(raios_calculados) / len(raios_calculados)
+        obs = ('Raio médio={:.1f}m (fator={:.2f} × distância média ao '
+               'não-contaminado mais próximo). Representação aproximada — '
+               'NÃO é polígono normativo de pluma.'
+               ).format(raio_medio, fator)
+        return geom_final, obs
+
+    # ==================================================================
+    # FUNÇÕES HELPER rv3 — EXTRAPOLAÇÃO DE PLUMAS ABERTAS
+    # ==================================================================
+
+    def _detectar_contaminados_borda(self, regs, arestas, gap_graus_min,
+                                     feedback):
+        """
+        rv4 — DETECÇÃO POR GAP ANGULAR (critério único).
+
+        Para cada ponto contaminado, calcula os ângulos dos vizinhos
+        Delaunay (medidos a partir do contaminado) e identifica o maior
+        "vão" angular entre vizinhos consecutivos. Se esse vão excede o
+        threshold gap_graus_min, o contaminado é considerado de borda
+        — significa que existe uma direção sem amostragem ao seu redor.
+
+        Diferente do rv3 (que usava convex hull + gap angular), o rv4
+        usa apenas o gap angular. Pontos que são vértices do convex hull
+        tipicamente têm gap muito grande (>180°) e passam automaticamente.
+        Pontos internos com vizinhança desbalanceada (caso PMN02/PM14)
+        agora são corretamente detectados.
+
+        Logs detalhados por contaminado para diagnóstico:
+            - ID, número de vizinhos Delaunay, gap angular medido,
+              decisão (detectado / não detectado).
+
+        Retorna lista de índices em 'regs' dos contaminados de borda.
+        """
+        idx_contaminados = [i for i, r in enumerate(regs) if r['contaminado']]
+        if not idx_contaminados:
+            return []
+
+        # Mapa de adjacência Delaunay
+        adj = defaultdict(set)
+        for ia, ib in arestas:
+            adj[ia].add(ib)
+            adj[ib].add(ia)
+
+        gap_rad_min = math.radians(gap_graus_min)
+        idx_borda = []
+
+        for ic in idx_contaminados:
+            pid = regs[ic]['pid']
+            pc = regs[ic]['pt']
+            vizinhos = adj.get(ic, set())
+
+            # Caso degenerado: contaminado isolado (sem vizinhos Delaunay)
+            if not vizinhos:
+                feedback.pushInfo(self.tr(
+                    '    {}: SEM vizinhos Delaunay → DETECTADO como borda '
+                    '(ponto isolado)').format(pid))
+                idx_borda.append(ic)
+                continue
+
+            # Caso degenerado: 1 vizinho só
+            if len(vizinhos) == 1:
+                feedback.pushInfo(self.tr(
+                    '    {}: apenas 1 vizinho Delaunay → DETECTADO como '
+                    'borda (gap = ~360°)').format(pid))
+                idx_borda.append(ic)
+                continue
+
+            # Cálculo padrão dos ângulos
+            angulos = []
+            for iv in vizinhos:
+                pv = regs[iv]['pt']
+                ang = math.atan2(pv.y() - pc.y(), pv.x() - pc.x())
+                if ang < 0:
+                    ang += 2 * math.pi
+                angulos.append(ang)
+            angulos.sort()
+
+            # Gaps consecutivos (incluindo wrap-around 2π → 0)
+            gaps = []
+            for i in range(len(angulos) - 1):
+                gaps.append(angulos[i + 1] - angulos[i])
+            gaps.append(2 * math.pi - angulos[-1] + angulos[0])
+
+            gap_max = max(gaps)
+            gap_max_graus = math.degrees(gap_max)
+
+            # Decisão e log
+            n_viz = len(vizinhos)
+            if gap_max >= gap_rad_min:
+                feedback.pushInfo(self.tr(
+                    '    {}: {} vizinhos, gap máximo = {:.1f}° → '
+                    'DETECTADO (limiar {:.0f}°)'
+                ).format(pid, n_viz, gap_max_graus, gap_graus_min))
+                idx_borda.append(ic)
+            else:
+                feedback.pushInfo(self.tr(
+                    '    {}: {} vizinhos, gap máximo = {:.1f}° → '
+                    'não detectado (limiar {:.0f}°)'
+                ).format(pid, n_viz, gap_max_graus, gap_graus_min))
+
+        return idx_borda
+
+    def _gerar_pontos_virtuais_borda(self, ic_borda, regs, arestas,
+                                     pls_pluma, fator, feedback):
+        """
+        Para um contaminado de borda, gera 3 pontos-limite virtuais em
+        arco no setor angular vazio (sem vizinhos Delaunay).
+
+        Geometria:
+            1. Identifica o maior gap angular entre vizinhos Delaunay
+            2. Calcula o ângulo central do gap
+            3. Calcula o raio = fator × mediana das distâncias do
+               contaminado aos seus vizinhos não-contaminados Delaunay
+            4. Posiciona 3 pontos: ângulo_central, ângulo_central ± 20°
+               (o arco fica menor que o gap real, mantendo segurança)
+
+        Retorna lista de dicts com a mesma estrutura dos pls reais,
+        mas com 'rn'=None e 'tipo'='extrapolado'. A lista pode ser
+        vazia se não for possível calcular (sem vizinhos não-cont, etc.).
+        """
+        rc = regs[ic_borda]
+        pc = rc['pt']
+
+        # Mapa de adjacência Delaunay
+        adj = defaultdict(set)
+        for ia, ib in arestas:
+            adj[ia].add(ib)
+            adj[ib].add(ia)
+
+        vizinhos = adj.get(ic_borda, set())
+        if not vizinhos:
+            feedback.pushWarning(self.tr(
+                '    extrapolação: contaminado {} sem vizinhos Delaunay; '
+                'pulando.').format(rc['pid']))
+            return []
+
+        # Calcular ângulos dos vizinhos e ordenar
+        angulos = []
+        for iv in vizinhos:
+            pv = regs[iv]['pt']
+            ang = math.atan2(pv.y() - pc.y(), pv.x() - pc.x())
+            if ang < 0:
+                ang += 2 * math.pi
+            angulos.append(ang)
+        angulos.sort()
+
+        # Identificar maior gap (incluindo wrap-around)
+        gap_max = 0.0
+        idx_gap = -1  # índice do início do gap em 'angulos'
+        for i in range(len(angulos) - 1):
+            g = angulos[i + 1] - angulos[i]
+            if g > gap_max:
+                gap_max = g
+                idx_gap = i
+        # gap wrap-around
+        g_wrap = 2 * math.pi - angulos[-1] + angulos[0]
+        if g_wrap > gap_max:
+            gap_max = g_wrap
+            idx_gap = len(angulos) - 1
+
+        # Ângulo de início do gap, e centro
+        if idx_gap == len(angulos) - 1:
+            # gap entre angulos[-1] e angulos[0] (wrap-around)
+            ang_inicio = angulos[-1]
+            ang_central = (ang_inicio + gap_max / 2.0) % (2 * math.pi)
+        else:
+            ang_inicio = angulos[idx_gap]
+            ang_central = ang_inicio + gap_max / 2.0
+
+        # Raio: mediana das distâncias do contaminado aos vizinhos
+        # NÃO-CONTAMINADOS Delaunay × fator
+        dist_nao_cont = []
+        for iv in vizinhos:
+            if not regs[iv]['contaminado']:
+                pv = regs[iv]['pt']
+                d = math.hypot(pv.x() - pc.x(), pv.y() - pc.y())
+                dist_nao_cont.append(d)
+
+        if not dist_nao_cont:
+            # Sem vizinhos não-contaminados — usar todos os vizinhos
+            for iv in vizinhos:
+                pv = regs[iv]['pt']
+                d = math.hypot(pv.x() - pc.x(), pv.y() - pc.y())
+                dist_nao_cont.append(d)
+
+        sorted_d = sorted(dist_nao_cont)
+        n = len(sorted_d)
+        mediana_d = sorted_d[n // 2] if n % 2 == 1 else \
+            0.5 * (sorted_d[n // 2 - 1] + sorted_d[n // 2])
+
+        raio = fator * mediana_d
+
+        # Gerar 3 pontos em arco: central ± 20°
+        delta = math.radians(20.0)  # afastamento angular dos laterais
+        angulos_pts = [ang_central - delta, ang_central, ang_central + delta]
+
+        pls_virtuais = []
+        for i, ang in enumerate(angulos_pts):
+            x = pc.x() + raio * math.cos(ang)
+            y = pc.y() + raio * math.sin(ang)
+            pl_v = {
+                'pt': QgsPointXY(x, y),
+                'rc': rc,
+                'rn': None,           # extrapolado: sem não-cont. real
+                'idx_cont': ic_borda,
+                'idx_nao_cont': -1,   # marcador para "sem par"
+                'tipo': 'extrapolado',
+                'observacao': 'Sem evidência amostral.',
+            }
+            pls_virtuais.append(pl_v)
+
+        feedback.pushInfo(self.tr(
+            '    extrapolação para {}: 3 pontos virtuais a {:.1f}m '
+            '(mediana {:.1f}m × fator {:.2f}).'
+        ).format(rc['pid'], raio, mediana_d, fator))
+
+        return pls_virtuais
+
+
+# ============================================================================
+# FIM DO MÓDULO
+# ============================================================================
